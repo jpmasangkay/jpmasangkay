@@ -36,7 +36,7 @@ impl Theme {
                 track_fill: "#21262d",
                 axis_line: "#30363d",
                 iso_levels: [
-                    ("#161b22", "#12171d", "#0d1117"),
+                    ("#1e242c", "#171c22", "#11161d"),
                     ("#0e4429", "#0a341f", "#072617"),
                     ("#006d32", "#005627", "#00421e"),
                     ("#26a641", "#1e8834", "#176b29"),
@@ -1028,11 +1028,15 @@ fn render_active_repositories(
         return;
     }
 
-    for (idx, repo) in repos.iter().take(4).enumerate() {
+    let visible: Vec<&ActiveRepo> = repos.iter().take(4).collect();
+    let any_stars = visible.iter().any(|r| r.stars > 0);
+    let (name_limit, lang_dot_x) = if any_stars { (22, 696.0) } else { (27, 740.0) };
+
+    for (idx, repo) in visible.iter().enumerate() {
         let row_y = layout.repos_first_y + idx as f64 * layout.repos_pitch;
         render_icon(svg, 472.0, row_y - 11.0, 13.0, ICON_REPO, palette.text_muted);
 
-        let name_esc = escape_xml(&truncate_chars(&repo.name, 22));
+        let name_esc = escape_xml(&truncate_chars(&repo.name, name_limit));
         let _ = writeln!(
             svg,
             r#"    <text x="490" y="{row_y:.1}" class="sans" font-size="12.5" font-weight="600" fill="{}">{name_esc}</text>"#,
@@ -1048,22 +1052,25 @@ fn render_active_repositories(
             let lang_esc = escape_xml(&truncate_chars(lang, 12));
             let _ = writeln!(
                 svg,
-                r#"    <circle cx="696" cy="{:.1}" r="3.5" fill="{dot_color}"/>"#,
+                r#"    <circle cx="{lang_dot_x:.0}" cy="{:.1}" r="3.5" fill="{dot_color}"/>"#,
                 row_y - 3.8
             );
             let _ = writeln!(
                 svg,
-                r#"    <text x="704" y="{row_y:.1}" class="sans" font-size="11" fill="{}">{lang_esc}</text>"#,
+                r#"    <text x="{:.0}" y="{row_y:.1}" class="sans" font-size="11" fill="{}">{lang_esc}</text>"#,
+                lang_dot_x + 8.0,
                 palette.text_muted
             );
         }
 
-        render_icon(svg, 796.0, row_y - 10.5, 12.0, ICON_STAR, palette.text_muted);
-        let _ = writeln!(
-            svg,
-            r#"    <text x="812" y="{row_y:.1}" class="sans" font-size="11" fill="{}">{}</text>"#,
-            palette.text_muted, repo.stars
-        );
+        if repo.stars > 0 {
+            render_icon(svg, 796.0, row_y - 10.5, 12.0, ICON_STAR, palette.text_muted);
+            let _ = writeln!(
+                svg,
+                r#"    <text x="812" y="{row_y:.1}" class="sans" font-size="11" fill="{}">{}</text>"#,
+                palette.text_muted, repo.stars
+            );
+        }
 
         let age = escape_xml(&format_relative_age(repo.pushed_at, now));
         let _ = writeln!(
@@ -1194,6 +1201,28 @@ mod tests {
         assert!(combined.contains(&"5 Stars"));
         assert!(combined.contains(&"Preferred license: MIT"));
         assert!(!combined.iter().any(|l| l.contains("Fork") || l.contains("Release") || l.contains("Follower")));
+    }
+
+    #[test]
+    fn active_repo_stars_omitted_when_zero_and_shown_when_positive() {
+        let mut data = mock_metrics("jpmasangkay", 8);
+        data.total_stars = 2;
+        for repo in &mut data.active_repos {
+            repo.stars = 0;
+        }
+
+        let svg_zero = render_metrics_svg(&data, Theme::Dark);
+        // Top summary still shows total stars, but no active-repo row star marker at x=796/812.
+        assert!(svg_zero.contains("2 Stars"));
+        assert!(!svg_zero.contains(r#"translate(796.0,"#));
+        assert!(!svg_zero.contains(r#"<text x="812""#));
+
+        // Give one repo stars > 0 -> only that row gets a star marker.
+        data.active_repos[1].stars = 7;
+        let svg_mixed = render_metrics_svg(&data, Theme::Dark);
+        assert_eq!(svg_mixed.matches(r#"translate(796.0,"#).count(), 1);
+        assert_eq!(svg_mixed.matches(r#"<text x="812""#).count(), 1);
+        assert!(svg_mixed.contains(r#">7</text>"#));
     }
 
     #[test]
