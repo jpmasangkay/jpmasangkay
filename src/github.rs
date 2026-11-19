@@ -10,11 +10,13 @@ const GITHUB_GRAPHQL_ENDPOINT: &str = "https://api.github.com/graphql";
 const USER_AGENT: &str = "jpmasangkay-profile-metrics";
 const MAX_HABIT_COMMITS: usize = 200;
 const CALENDAR_WEEKS: usize = 26;
+const RECENT_COMMITS_DAYS: i64 = 30;
 const RECENT_ACTIVITY_DAYS: i64 = 90;
 const TOP_LANGUAGES_LIMIT: usize = 8;
 const RECENT_LANGUAGES_LIMIT: usize = 4;
 const TOP_ACTIVE_REPOS_LIMIT: usize = 4;
 const TOP_TOPICS_LIMIT: usize = 10;
+const TOP_DIAGNOSTIC_REPOS_LIMIT: usize = 5;
 
 const OVERVIEW_QUERY: &str = r#"
 query UserOverview($login: String!, $from: DateTime!, $to: DateTime!) {
@@ -49,7 +51,6 @@ query OwnedRepositories($login: String!, $cursor: String, $authorId: ID!) {
       after: $cursor
       ownerAffiliations: OWNER
       isFork: false
-      privacy: PUBLIC
       orderBy: { field: PUSHED_AT, direction: DESC }
     ) {
       pageInfo {
@@ -58,6 +59,7 @@ query OwnedRepositories($login: String!, $cursor: String, $authorId: ID!) {
       }
       nodes {
         name
+        isPrivate
         stargazerCount
         forkCount
         diskUsage
@@ -119,11 +121,11 @@ pub struct ContributionDay {
 pub struct LanguageShare {
     pub name: String,
     pub color: String,
-    pub bytes: u64,
+    pub weight: f64,
     pub percent: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRepo {
     pub name: String,
     pub primary_language: Option<String>,
@@ -132,18 +134,46 @@ pub struct ActiveRepo {
     pub pushed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSizeDiagnostic {
+    pub name: String,
+    pub raw_bytes: u64,
+    pub primary_language: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoLanguageSample {
+    pub name: String,
+    pub bytes: u64,
+    pub color: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoSummary {
+    pub name: String,
+    pub is_private: bool,
+    pub stars: u32,
+    pub pushed_at: Option<DateTime<Utc>>,
+    pub primary_language: Option<String>,
+    pub primary_language_color: Option<String>,
+    pub languages: Vec<RepoLanguageSample>,
+    pub topics: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MetricsData {
     pub login: String,
     pub joined_at: DateTime<Utc>,
     pub followers: u32,
     pub repo_count: u32,
+    pub active_repos_90d: u32,
     pub total_stars: u32,
     pub total_forks: u32,
     pub total_releases: u32,
     pub total_disk_kb: u64,
     pub preferred_license: Option<String>,
     pub contributions_1y: u32,
+    pub commits_30d: u32,
     pub tz_offset_hours: i32,
     pub hourly_commits: [u32; 24],
     pub weekday_commits: [u32; 7],
@@ -156,6 +186,7 @@ pub struct MetricsData {
     pub recent_languages: Vec<LanguageShare>,
     pub active_repos: Vec<ActiveRepo>,
     pub topics: Vec<String>,
+    pub top_public_repos_by_bytes: Vec<RepoSizeDiagnostic>,
     pub generated_at: DateTime<Utc>,
 }
 
@@ -246,6 +277,7 @@ struct PageInfo {
 #[serde(rename_all = "camelCase")]
 struct RepoNode {
     name: String,
+    is_private: bool,
     stargazer_count: u32,
     fork_count: u32,
     disk_usage: Option<u64>,
@@ -385,7 +417,15 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
 
     let all_weeks = parse_calendar_weeks(&user.contributions_collection.contribution_calendar);
     let all_days: Vec<&ContributionDay> = all_weeks.iter().flatten().collect();
-    let (current_streak, longest_streak) = compute_streaks(&all_days, now.date_naive());
+    let today = now.date_naive();
+    let (current_streak, longest_streak) = compute_streaks(&all_days, today);
+
+    let cutoff_30d = today - ChronoDuration::days(RECENT_COMMITS_DAYS - 1);
+    let commits_30d: u32 = all_days
+        .iter()
+        .filter(|d| d.date >= cutoff_30d && d.date <= today)
+        .map(|d| d.count)
+        .sum();
 
     let half_year_weeks = take_recent_weeks(&all_weeks, CALENDAR_WEEKS);
     let half_year_days: Vec<&ContributionDay> = half_year_weeks.iter().flatten().collect();
@@ -406,7 +446,7 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
         .rev()
         .collect();
 
-    // Cursor-paginate through EVERY non-fork public repository owned by the user.
+    // Cursor-paginate through EVERY non-fork repository owned by the user.
     let mut repos: Vec<RepoNode> = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -439,11 +479,11 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
     let mut total_forks = 0u32;
     let mut total_releases = 0u32;
     let mut total_disk_kb = 0u64;
+    let mut active_repos_90d = 0u32;
     let mut license_counts: HashMap<String, u32> = HashMap::new();
-    let mut all_lang_bytes: HashMap<String, (u64, String)> = HashMap::new();
-    let mut recent_lang_bytes: HashMap<String, (u64, String)> = HashMap::new();
-    let mut topic_counts: HashMap<String, u32> = HashMap::new();
-    let mut active_repos: Vec<ActiveRepo> = Vec::new();
+    let mut repo_summaries: Vec<RepoSummary> = Vec::with_capacity(repos.len());
+    let mut all_repo_languages: Vec<Vec<RepoLanguageSample>> = Vec::new();
+    let mut recent_repo_languages: Vec<Vec<RepoLanguageSample>> = Vec::new();
     let mut seen_oids: HashSet<String> = HashSet::new();
     let mut authored_timestamps: Vec<DateTime<Utc>> = Vec::new();
 
@@ -473,50 +513,56 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
             .map(|dt| dt.with_timezone(&Utc));
         let is_recent_repo = pushed_at.is_some_and(|ts| ts >= recent_cutoff);
 
-        for edge in repo.languages.edges.iter().flatten() {
-            if edge.size == 0 {
-                continue;
-            }
-            let color = edge
-                .node
-                .color
-                .clone()
-                .unwrap_or_else(|| "#8b949e".to_string());
+        if is_recent_repo && !repo.name.eq_ignore_ascii_case(&user.login) {
+            active_repos_90d = active_repos_90d.saturating_add(1);
+        }
 
-            let entry = all_lang_bytes
-                .entry(edge.node.name.clone())
-                .or_insert_with(|| (0, color.clone()));
-            entry.0 = entry.0.saturating_add(edge.size);
+        let lang_samples: Vec<RepoLanguageSample> = repo
+            .languages
+            .edges
+            .iter()
+            .flatten()
+            .filter(|edge| edge.size > 0)
+            .map(|edge| RepoLanguageSample {
+                name: edge.node.name.clone(),
+                bytes: edge.size,
+                color: edge
+                    .node
+                    .color
+                    .clone()
+                    .unwrap_or_else(|| "#8b949e".to_string()),
+            })
+            .collect();
 
+        if !lang_samples.is_empty() {
             if is_recent_repo {
-                let recent_entry = recent_lang_bytes
-                    .entry(edge.node.name.clone())
-                    .or_insert_with(|| (0, color));
-                recent_entry.0 = recent_entry.0.saturating_add(edge.size);
+                recent_repo_languages.push(lang_samples.clone());
             }
+            all_repo_languages.push(lang_samples.clone());
         }
 
-        for topic_node in repo.repository_topics.nodes.iter().flatten() {
-            let name = topic_node.topic.name.trim().to_ascii_lowercase();
-            if !name.is_empty() {
-                *topic_counts.entry(name).or_insert(0) += 1;
-            }
-        }
+        let topics: Vec<String> = repo
+            .repository_topics
+            .nodes
+            .iter()
+            .flatten()
+            .map(|t| t.topic.name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect();
 
-        if let Some(ts) = pushed_at {
-            if !repo.name.eq_ignore_ascii_case(&user.login) {
-                active_repos.push(ActiveRepo {
-                    name: repo.name.clone(),
-                    primary_language: repo.primary_language.as_ref().map(|l| l.name.clone()),
-                    primary_language_color: repo
-                        .primary_language
-                        .as_ref()
-                        .and_then(|l| l.color.clone()),
-                    stars: repo.stargazer_count,
-                    pushed_at: ts,
-                });
-            }
-        }
+        repo_summaries.push(RepoSummary {
+            name: repo.name.clone(),
+            is_private: repo.is_private,
+            stars: repo.stargazer_count,
+            pushed_at,
+            primary_language: repo.primary_language.as_ref().map(|l| l.name.clone()),
+            primary_language_color: repo
+                .primary_language
+                .as_ref()
+                .and_then(|l| l.color.clone()),
+            languages: lang_samples,
+            topics,
+        });
 
         if let Some(nodes) = repo
             .default_branch_ref
@@ -542,32 +588,28 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
     let (hourly_commits, weekday_commits) =
         bucket_commit_timestamps(&authored_timestamps, tz_offset_hours);
 
-    // Preferred license: most frequent SPDX/name across owned repos.
     let preferred_license = license_counts
         .into_iter()
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
         .map(|(name, _)| name);
 
-    let languages = build_language_shares(all_lang_bytes, TOP_LANGUAGES_LIMIT, true);
-    let recent_languages = build_language_shares(recent_lang_bytes, RECENT_LANGUAGES_LIMIT, false);
+    let languages = aggregate_normalized_languages(&all_repo_languages, TOP_LANGUAGES_LIMIT, true);
+    let recent_languages =
+        aggregate_normalized_languages(&recent_repo_languages, RECENT_LANGUAGES_LIMIT, false);
 
-    active_repos.sort_by(|a, b| {
-        b.pushed_at
-            .cmp(&a.pushed_at)
-            .then_with(|| b.stars.cmp(&a.stars))
-    });
-    active_repos.truncate(TOP_ACTIVE_REPOS_LIMIT);
-
-    let mut ranked_topics: Vec<(String, u32)> = topic_counts.into_iter().collect();
-    ranked_topics.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    ranked_topics.truncate(TOP_TOPICS_LIMIT);
-    let topics: Vec<String> = ranked_topics.into_iter().map(|(name, _)| name).collect();
+    // Strict privacy guards: private repos are NEVER exposed in active repos, topics, or stdout logs.
+    let active_repos =
+        filter_public_active_repos(&repo_summaries, &user.login, TOP_ACTIVE_REPOS_LIMIT);
+    let topics = collect_public_topics(&repo_summaries, TOP_TOPICS_LIMIT);
+    let top_public_repos_by_bytes =
+        top_public_repos_by_raw_bytes(&repo_summaries, TOP_DIAGNOSTIC_REPOS_LIMIT);
 
     Ok(MetricsData {
         login: user.login,
         joined_at,
         followers: user.followers.total_count,
         repo_count: repos.len() as u32,
+        active_repos_90d,
         total_stars,
         total_forks,
         total_releases,
@@ -577,6 +619,7 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
             .contributions_collection
             .contribution_calendar
             .total_contributions,
+        commits_30d,
         tz_offset_hours,
         hourly_commits,
         weekday_commits,
@@ -589,8 +632,192 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
         recent_languages,
         active_repos,
         topics,
+        top_public_repos_by_bytes,
         generated_at: now,
     })
+}
+
+/// Computes per-repository normalized language shares.
+///
+/// Each repository with language bytes contributes a total weight of `1.0`, split across
+/// its languages proportionally to its byte breakdown. Summing across repositories keeps a
+/// single multi-megabyte repository from drowning out smaller repositories.
+pub fn aggregate_normalized_languages(
+    repos: &[Vec<RepoLanguageSample>],
+    top_limit: usize,
+    include_other: bool,
+) -> Vec<LanguageShare> {
+    let mut totals: HashMap<String, (f64, String)> = HashMap::new();
+
+    for repo_langs in repos {
+        let repo_total_bytes: u64 = repo_langs.iter().map(|l| l.bytes).sum();
+        if repo_total_bytes == 0 {
+            continue;
+        }
+        let denom = repo_total_bytes as f64;
+
+        for lang in repo_langs {
+            if lang.bytes == 0 {
+                continue;
+            }
+            let normalized_share = lang.bytes as f64 / denom;
+            let entry = totals
+                .entry(lang.name.clone())
+                .or_insert_with(|| (0.0, lang.color.clone()));
+            entry.0 += normalized_share;
+        }
+    }
+
+    let mut ranked: Vec<(String, f64, String)> = totals
+        .into_iter()
+        .map(|(name, (weight, color))| (name, weight, color))
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let grand_total: f64 = ranked.iter().map(|(_, weight, _)| *weight).sum();
+    if grand_total <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+    let mut other_weight = 0.0;
+
+    for (idx, (name, weight, color)) in ranked.into_iter().enumerate() {
+        if idx < top_limit {
+            result.push(LanguageShare {
+                name,
+                color,
+                weight,
+                percent: (weight / grand_total) * 100.0,
+            });
+        } else {
+            other_weight += weight;
+        }
+    }
+
+    if include_other && other_weight > 0.0 {
+        result.push(LanguageShare {
+            name: "Other".to_string(),
+            color: "#8b949e".to_string(),
+            weight: other_weight,
+            percent: (other_weight / grand_total) * 100.0,
+        });
+    }
+
+    result
+}
+
+/// Strictly filters active repositories to public non-profile repositories.
+pub fn filter_public_active_repos(
+    repos: &[RepoSummary],
+    profile_login: &str,
+    limit: usize,
+) -> Vec<ActiveRepo> {
+    let mut active: Vec<ActiveRepo> = repos
+        .iter()
+        .filter(|repo| !repo.is_private && !repo.name.eq_ignore_ascii_case(profile_login))
+        .filter_map(|repo| {
+            let pushed_at = repo.pushed_at?;
+            Some(ActiveRepo {
+                name: repo.name.clone(),
+                primary_language: repo.primary_language.clone(),
+                primary_language_color: repo.primary_language_color.clone(),
+                stars: repo.stars,
+                pushed_at,
+            })
+        })
+        .collect();
+
+    active.sort_by(|a, b| {
+        b.pushed_at
+            .cmp(&a.pushed_at)
+            .then_with(|| b.stars.cmp(&a.stars))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    active.truncate(limit);
+    active
+}
+
+/// Strictly aggregates topics from public repositories only.
+pub fn collect_public_topics(repos: &[RepoSummary], limit: usize) -> Vec<String> {
+    let mut topic_counts: HashMap<String, u32> = HashMap::new();
+    for repo in repos.iter().filter(|r| !r.is_private) {
+        for topic in &repo.topics {
+            if !topic.is_empty() {
+                *topic_counts.entry(topic.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut ranked: Vec<(String, u32)> = topic_counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(limit);
+    ranked.into_iter().map(|(name, _)| name).collect()
+}
+
+/// Strictly ranks top public repositories by raw language bytes for CI log diagnostics.
+pub fn top_public_repos_by_raw_bytes(
+    repos: &[RepoSummary],
+    limit: usize,
+) -> Vec<RepoSizeDiagnostic> {
+    let mut rows: Vec<RepoSizeDiagnostic> = repos
+        .iter()
+        .filter(|repo| !repo.is_private)
+        .map(|repo| {
+            let raw_bytes: u64 = repo.languages.iter().map(|l| l.bytes).sum();
+            let primary_language = repo
+                .primary_language
+                .clone()
+                .unwrap_or_else(|| "None".to_string());
+            RepoSizeDiagnostic {
+                name: repo.name.clone(),
+                raw_bytes,
+                primary_language,
+            }
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        b.raw_bytes
+            .cmp(&a.raw_bytes)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    rows.truncate(limit);
+    rows
+}
+
+pub fn format_raw_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+pub fn print_repo_size_diagnostics(rows: &[RepoSizeDiagnostic]) {
+    println!("Top public repositories by raw language byte size:");
+    if rows.is_empty() {
+        println!("  (no public repositories found)");
+        return;
+    }
+    for (idx, row) in rows.iter().enumerate() {
+        println!(
+            "  {}. {:<28} {:>10}  ({})",
+            idx + 1,
+            row.name,
+            format_raw_bytes(row.raw_bytes),
+            row.primary_language
+        );
+    }
 }
 
 fn parse_contribution_level(level: &str, count: u32) -> u8 {
@@ -710,50 +937,6 @@ pub fn bucket_commit_timestamps(
     (hourly, weekday)
 }
 
-fn build_language_shares(
-    totals: HashMap<String, (u64, String)>,
-    top_limit: usize,
-    include_other: bool,
-) -> Vec<LanguageShare> {
-    let mut ranked: Vec<(String, u64, String)> = totals
-        .into_iter()
-        .map(|(name, (bytes, color))| (name, bytes, color))
-        .collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-    let grand_total: u64 = ranked.iter().map(|(_, bytes, _)| *bytes).sum();
-    if grand_total == 0 {
-        return Vec::new();
-    }
-
-    let mut result = Vec::new();
-    let mut other_bytes = 0u64;
-
-    for (idx, (name, bytes, color)) in ranked.into_iter().enumerate() {
-        if idx < top_limit {
-            result.push(LanguageShare {
-                name,
-                color,
-                bytes,
-                percent: (bytes as f64 / grand_total as f64) * 100.0,
-            });
-        } else {
-            other_bytes = other_bytes.saturating_add(bytes);
-        }
-    }
-
-    if include_other && other_bytes > 0 {
-        result.push(LanguageShare {
-            name: "Other".to_string(),
-            color: "#8b949e".to_string(),
-            bytes: other_bytes,
-            percent: (other_bytes as f64 / grand_total as f64) * 100.0,
-        });
-    }
-
-    result
-}
-
 /// Deterministic offline mock dataset for layout inspection (`--mock`).
 pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
     let now = Utc::now();
@@ -772,10 +955,8 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
         let r = ((seed >> 33) % 100) as u32;
 
         let count = if (48..67).contains(&i) {
-            // Earlier 19-day sprint so longest streak > current streak.
             1 + (r % 9)
         } else if i >= total_days - 8 {
-            // Active 8-day current streak.
             1 + (r % 7)
         } else if r < 34 {
             0
@@ -810,6 +991,12 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
     let (current_streak, longest_streak) = compute_streaks(&flat_days, today);
     let total_half_year: u32 = flat_days.iter().map(|d| d.count).sum();
     let avg_commits_per_day = f64::from(total_half_year) / flat_days.len().max(1) as f64;
+    let cutoff_30d = today - ChronoDuration::days(RECENT_COMMITS_DAYS - 1);
+    let commits_30d: u32 = flat_days
+        .iter()
+        .filter(|d| d.date >= cutoff_30d && d.date <= today)
+        .map(|d| d.count)
+        .sum();
     let recent_12_levels: Vec<u8> = flat_days
         .iter()
         .rev()
@@ -829,55 +1016,55 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
         LanguageShare {
             name: "Rust".to_string(),
             color: "#dea584".to_string(),
-            bytes: 421_000,
+            weight: 4.21,
             percent: 42.1,
         },
         LanguageShare {
             name: "TypeScript".to_string(),
             color: "#3178c6".to_string(),
-            bytes: 248_000,
+            weight: 2.48,
             percent: 24.8,
         },
         LanguageShare {
             name: "Java".to_string(),
             color: "#b07219".to_string(),
-            bytes: 112_000,
+            weight: 1.12,
             percent: 11.2,
         },
         LanguageShare {
             name: "Dart".to_string(),
             color: "#00b4ab".to_string(),
-            bytes: 68_000,
+            weight: 0.68,
             percent: 6.8,
         },
         LanguageShare {
             name: "Python".to_string(),
             color: "#3572a5".to_string(),
-            bytes: 46_000,
+            weight: 0.46,
             percent: 4.6,
         },
         LanguageShare {
             name: "C".to_string(),
             color: "#555555".to_string(),
-            bytes: 34_000,
+            weight: 0.34,
             percent: 3.4,
         },
         LanguageShare {
             name: "HTML".to_string(),
             color: "#e34c26".to_string(),
-            bytes: 28_000,
+            weight: 0.28,
             percent: 2.8,
         },
         LanguageShare {
             name: "Shell".to_string(),
             color: "#89e051".to_string(),
-            bytes: 21_000,
+            weight: 0.21,
             percent: 2.1,
         },
         LanguageShare {
             name: "Other".to_string(),
             color: "#8b949e".to_string(),
-            bytes: 22_000,
+            weight: 0.22,
             percent: 2.2,
         },
     ];
@@ -886,25 +1073,25 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
         LanguageShare {
             name: "Rust".to_string(),
             color: "#dea584".to_string(),
-            bytes: 614_000,
+            weight: 2.456,
             percent: 61.4,
         },
         LanguageShare {
             name: "TypeScript".to_string(),
             color: "#3178c6".to_string(),
-            bytes: 228_000,
+            weight: 0.912,
             percent: 22.8,
         },
         LanguageShare {
             name: "HTML".to_string(),
             color: "#e34c26".to_string(),
-            bytes: 94_000,
+            weight: 0.376,
             percent: 9.4,
         },
         LanguageShare {
             name: "Shell".to_string(),
             color: "#89e051".to_string(),
-            bytes: 64_000,
+            weight: 0.256,
             percent: 6.4,
         },
     ];
@@ -951,17 +1138,47 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
         "systems".to_string(),
     ];
 
+    let top_public_repos_by_bytes = vec![
+        RepoSizeDiagnostic {
+            name: "rustboy-advance".to_string(),
+            raw_bytes: 1_480_000,
+            primary_language: "Rust".to_string(),
+        },
+        RepoSizeDiagnostic {
+            name: "heartconnect".to_string(),
+            raw_bytes: 820_000,
+            primary_language: "TypeScript".to_string(),
+        },
+        RepoSizeDiagnostic {
+            name: "hearthsand".to_string(),
+            raw_bytes: 540_000,
+            primary_language: "Rust".to_string(),
+        },
+        RepoSizeDiagnostic {
+            name: "logpulse".to_string(),
+            raw_bytes: 310_000,
+            primary_language: "Rust".to_string(),
+        },
+        RepoSizeDiagnostic {
+            name: "b3dup".to_string(),
+            raw_bytes: 145_000,
+            primary_language: "Rust".to_string(),
+        },
+    ];
+
     MetricsData {
         login: username.to_string(),
         joined_at: now - ChronoDuration::days(365 * 4 + 90),
         followers: 24,
         repo_count: 28,
+        active_repos_90d: 6,
         total_stars: 56,
         total_forks: 11,
         total_releases: 9,
         total_disk_kb: 74_820,
         preferred_license: Some("MIT".to_string()),
         contributions_1y: 684,
+        commits_30d,
         tz_offset_hours,
         hourly_commits,
         weekday_commits,
@@ -974,6 +1191,149 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
         recent_languages,
         active_repos,
         topics,
+        top_public_repos_by_bytes,
         generated_at: now,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn normalized_language_weighting_prevents_large_repo_skew() {
+        // 1 huge 50 MB C# repo vs 4 lean 100 KB Rust repos.
+        let repos = vec![
+            vec![RepoLanguageSample {
+                name: "C#".to_string(),
+                bytes: 50_000_000,
+                color: "#178600".to_string(),
+            }],
+            vec![RepoLanguageSample {
+                name: "Rust".to_string(),
+                bytes: 100_000,
+                color: "#dea584".to_string(),
+            }],
+            vec![RepoLanguageSample {
+                name: "Rust".to_string(),
+                bytes: 100_000,
+                color: "#dea584".to_string(),
+            }],
+            vec![RepoLanguageSample {
+                name: "Rust".to_string(),
+                bytes: 100_000,
+                color: "#dea584".to_string(),
+            }],
+            vec![RepoLanguageSample {
+                name: "Rust".to_string(),
+                bytes: 100_000,
+                color: "#dea584".to_string(),
+            }],
+        ];
+
+        let shares = aggregate_normalized_languages(&repos, 8, true);
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].name, "Rust");
+        assert!((shares[0].percent - 80.0).abs() < 1e-6);
+        assert_eq!(shares[1].name, "C#");
+        assert!((shares[1].percent - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalized_language_weighting_splits_mixed_repo_shares_to_one() {
+        // Repo 1: 80% Rust / 20% Shell -> contributes 0.8 Rust, 0.2 Shell.
+        // Repo 2: 100% TypeScript -> contributes 1.0 TypeScript.
+        let repos = vec![
+            vec![
+                RepoLanguageSample {
+                    name: "Rust".to_string(),
+                    bytes: 800,
+                    color: "#dea584".to_string(),
+                },
+                RepoLanguageSample {
+                    name: "Shell".to_string(),
+                    bytes: 200,
+                    color: "#89e051".to_string(),
+                },
+            ],
+            vec![RepoLanguageSample {
+                name: "TypeScript".to_string(),
+                bytes: 500_000,
+                color: "#3178c6".to_string(),
+            }],
+        ];
+
+        let shares = aggregate_normalized_languages(&repos, 8, true);
+        assert_eq!(shares.len(), 3);
+        assert_eq!(shares[0].name, "TypeScript");
+        assert!((shares[0].percent - 50.0).abs() < 1e-6);
+        assert_eq!(shares[1].name, "Rust");
+        assert!((shares[1].percent - 40.0).abs() < 1e-6);
+        assert_eq!(shares[2].name, "Shell");
+        assert!((shares[2].percent - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn privacy_guard_excludes_private_repos_from_active_topics_and_diagnostics() {
+        let t1 = Utc.with_ymd_and_hms(2026, 11, 19, 10, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 11, 18, 10, 0, 0).unwrap();
+
+        let repos = vec![
+            RepoSummary {
+                name: "secret-client-app".to_string(),
+                is_private: true,
+                stars: 99,
+                pushed_at: Some(t1),
+                primary_language: Some("C#".to_string()),
+                primary_language_color: Some("#178600".to_string()),
+                languages: vec![RepoLanguageSample {
+                    name: "C#".to_string(),
+                    bytes: 90_000_000,
+                    color: "#178600".to_string(),
+                }],
+                topics: vec!["confidential".to_string(), "internal".to_string()],
+            },
+            RepoSummary {
+                name: "jpmasangkay".to_string(),
+                is_private: false,
+                stars: 1,
+                pushed_at: Some(t1),
+                primary_language: Some("Rust".to_string()),
+                primary_language_color: Some("#dea584".to_string()),
+                languages: vec![RepoLanguageSample {
+                    name: "Rust".to_string(),
+                    bytes: 25_000,
+                    color: "#dea584".to_string(),
+                }],
+                topics: vec![],
+            },
+            RepoSummary {
+                name: "rustboy-advance".to_string(),
+                is_private: false,
+                stars: 12,
+                pushed_at: Some(t2),
+                primary_language: Some("Rust".to_string()),
+                primary_language_color: Some("#dea584".to_string()),
+                languages: vec![RepoLanguageSample {
+                    name: "Rust".to_string(),
+                    bytes: 400_000,
+                    color: "#dea584".to_string(),
+                }],
+                topics: vec!["rust".to_string(), "emulator".to_string()],
+            },
+        ];
+
+        let active = filter_public_active_repos(&repos, "jpmasangkay", 4);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].name, "rustboy-advance");
+
+        let topics = collect_public_topics(&repos, 10);
+        assert_eq!(topics, vec!["emulator", "rust"]);
+        assert!(!topics.iter().any(|t| t == "confidential" || t == "internal"));
+
+        let diag = top_public_repos_by_raw_bytes(&repos, 5);
+        assert!(diag.iter().all(|d| d.name != "secret-client-app"));
+        assert_eq!(diag[0].name, "rustboy-advance");
     }
 }

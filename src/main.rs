@@ -111,6 +111,8 @@ fn main() -> Result<()> {
         github::fetch_live_metrics(&token, &args.username, args.tz_offset)?
     };
 
+    github::print_repo_size_diagnostics(&data.top_public_repos_by_bytes);
+
     let dark_svg = svg::render_metrics_svg(&data, Theme::Dark);
     let light_svg = svg::render_metrics_svg(&data, Theme::Light);
 

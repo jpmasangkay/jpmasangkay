@@ -62,6 +62,12 @@ impl Theme {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatRow {
+    pub icon: &'static str,
+    pub label: String,
+}
+
 // Inline 16x16 Octicon-style monochrome paths (zero external assets, zero emojis).
 const ICON_PERSON: &str = "M10.561 8.073a6.005 6.005 0 0 1 3.432 5.142.75.75 0 1 1-1.498.07 4.5 4.5 0 0 0-8.99 0 .75.75 0 0 1-1.498-.07 6.004 6.004 0 0 1 3.431-5.142 3.999 3.999 0 1 1 5.123 0ZM10.5 5a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0Z";
 const ICON_CLOCK: &str = "M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm7-3.25v2.992l2.028.812a.75.75 0 0 1-.557 1.392l-2.5-1A.751.751 0 0 1 7 8.25v-3.5a.75.75 0 0 1 1.5 0Z";
@@ -76,6 +82,7 @@ const ICON_PULSE: &str = "M6 2c.306 0 .582.187.696.471L10 10.731l1.304-3.26A.751
 const ICON_CALENDAR: &str = "M4.75 0a.75.75 0 0 1 .75.75V2h5V.75a.75.75 0 0 1 1.5 0V2h1.25c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 13.25 16H2.75A1.75 1.75 0 0 1 1 14.25V3.75C1 2.784 1.784 2 2.75 2H4V.75A.75.75 0 0 1 4.75 0ZM2.5 7.5v6.75c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25V7.5Zm10.75-4H2.75a.25.25 0 0 0-.25.25V6h11V3.75a.25.25 0 0 0-.25-.25Z";
 const ICON_CODE: &str = "M4.72 3.22a.75.75 0 0 1 1.06 1.06L2.06 8l3.72 3.72a.75.75 0 1 1-1.06 1.06L.47 8.53a.75.75 0 0 1 0-1.06l4.25-4.25Zm6.56 0a.75.75 0 1 0-1.06 1.06L13.94 8l-3.72 3.72a.75.75 0 1 0 1.06 1.06l4.25-4.25a.75.75 0 0 0 0-1.06l-4.25-4.25Z";
 const ICON_COMMIT: &str = "M11.93 8.5a4.002 4.002 0 0 1-7.86 0H.75a.75.75 0 0 1 0-1.5h3.32a4.002 4.002 0 0 1 7.86 0h3.32a.75.75 0 0 1 0 1.5Zm-1.43-.75a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0Z";
+const ICON_GRAPH: &str = "M1.5 1.75V13.5h13.75a.75.75 0 0 1 0 1.5H.75a.75.75 0 0 1-.75-.75V1.75a.75.75 0 0 1 1.5 0Zm14.28 2.53-5.25 5.25a.75.75 0 0 1-1.06 0L7 7.06 4.28 9.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.25-3.25a.75.75 0 0 1 1.06 0L10 7.94l4.72-4.72a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042Z";
 
 pub fn escape_xml(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -186,6 +193,14 @@ fn format_tz_label(offset_hours: i32) -> String {
     }
 }
 
+fn pluralize(count: u32, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
 fn sanitize_hex_color(color: &str, fallback: &str) -> String {
     let trimmed = color.trim();
     if (trimmed.len() == 7 || trimmed.len() == 4)
@@ -196,6 +211,86 @@ fn sanitize_hex_color(color: &str, fallback: &str) -> String {
     } else {
         fallback.to_string()
     }
+}
+
+/// Builds the top-left 2-column stat list dynamically, omitting zero-value optional metrics
+/// and keeping both columns evenly balanced regardless of how many rows are active.
+pub fn build_stat_rows(data: &MetricsData) -> (Vec<StatRow>, Vec<StatRow>) {
+    let mut rows = Vec::with_capacity(11);
+
+    // Always-shown high-signal metrics.
+    rows.push(StatRow {
+        icon: ICON_CLOCK,
+        label: format_joined_ago(data.joined_at, data.generated_at),
+    });
+    rows.push(StatRow {
+        icon: ICON_REPO,
+        label: pluralize(data.repo_count, "Repository", "Repositories"),
+    });
+    rows.push(StatRow {
+        icon: ICON_PULSE,
+        label: pluralize(
+            data.active_repos_90d,
+            "Active repo (90d)",
+            "Active repos (90d)",
+        ),
+    });
+    rows.push(StatRow {
+        icon: ICON_DATABASE,
+        label: format!("{} disk used", format_disk_usage(data.total_disk_kb)),
+    });
+    if let Some(license) = &data.preferred_license {
+        let trimmed = license.trim();
+        if !trimmed.is_empty() {
+            rows.push(StatRow {
+                icon: ICON_LAW,
+                label: format!("Preferred license: {}", truncate_chars(trimmed, 14)),
+            });
+        }
+    }
+
+    rows.push(StatRow {
+        icon: ICON_COMMIT,
+        label: pluralize(
+            data.contributions_1y,
+            "Contribution (1y)",
+            "Contributions (1y)",
+        ),
+    });
+    rows.push(StatRow {
+        icon: ICON_GRAPH,
+        label: pluralize(data.commits_30d, "Commit (30d)", "Commits (30d)"),
+    });
+
+    // Conditionally shown only when > 0.
+    if data.total_stars > 0 {
+        rows.push(StatRow {
+            icon: ICON_STAR,
+            label: pluralize(data.total_stars, "Star", "Stars"),
+        });
+    }
+    if data.total_forks > 0 {
+        rows.push(StatRow {
+            icon: ICON_FORK,
+            label: pluralize(data.total_forks, "Fork", "Forks"),
+        });
+    }
+    if data.total_releases > 0 {
+        rows.push(StatRow {
+            icon: ICON_TAG,
+            label: pluralize(data.total_releases, "Release", "Releases"),
+        });
+    }
+    if data.followers > 0 {
+        rows.push(StatRow {
+            icon: ICON_PEOPLE,
+            label: pluralize(data.followers, "Follower", "Followers"),
+        });
+    }
+
+    let split_idx = rows.len().div_ceil(2);
+    let right = rows.split_off(split_idx);
+    (rows, right)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -227,8 +322,59 @@ pub fn compute_iso_tile(
     (cx, cy, height)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RightColumnLayout {
+    has_topics: bool,
+    iso_origin_y: f64,
+    stats_start_y: f64,
+    key_y: f64,
+    lang_heading_y: f64,
+    lang_bar_y: f64,
+    lang_legend_ys: [f64; 2],
+    repos_heading_y: f64,
+    repos_first_y: f64,
+    repos_pitch: f64,
+    topics_heading_y: f64,
+    topics_row_ys: [f64; 2],
+}
+
+fn right_column_layout(has_topics: bool) -> RightColumnLayout {
+    if has_topics {
+        RightColumnLayout {
+            has_topics: true,
+            iso_origin_y: 60.0,
+            stats_start_y: 60.0,
+            key_y: 174.0,
+            lang_heading_y: 207.0,
+            lang_bar_y: 218.0,
+            lang_legend_ys: [246.0, 265.0],
+            repos_heading_y: 301.0,
+            repos_first_y: 326.0,
+            repos_pitch: 26.0,
+            topics_heading_y: 444.0,
+            topics_row_ys: [466.0, 484.0],
+        }
+    } else {
+        RightColumnLayout {
+            has_topics: false,
+            iso_origin_y: 64.0,
+            stats_start_y: 64.0,
+            key_y: 182.0,
+            lang_heading_y: 224.0,
+            lang_bar_y: 236.0,
+            lang_legend_ys: [266.0, 287.0],
+            repos_heading_y: 332.0,
+            repos_first_y: 362.0,
+            repos_pitch: 32.0,
+            topics_heading_y: 0.0,
+            topics_row_ys: [0.0, 0.0],
+        }
+    }
+}
+
 pub fn render_metrics_svg(data: &MetricsData, theme: Theme) -> String {
     let palette = theme.palette();
+    let right_layout = right_column_layout(!data.topics.is_empty());
     let mut svg = String::with_capacity(28_000);
 
     let login_esc = escape_xml(&data.login);
@@ -237,21 +383,22 @@ pub fn render_metrics_svg(data: &MetricsData, theme: Theme) -> String {
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {WIDTH} {HEIGHT}" width="{WIDTH}" height="{HEIGHT}" role="img" aria-label="{login_esc} GitHub metrics">"#
     );
 
-    svg.push_str(
+    let _ = writeln!(
+        svg,
         r#"  <defs>
     <clipPath id="lang-bar-clip">
-      <rect x="472" y="218" width="432" height="8" rx="4"/>
+      <rect x="472" y="{:.0}" width="432" height="8" rx="4"/>
     </clipPath>
   </defs>
   <style>
-    .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  </style>
-"#,
+    .sans {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+  </style>"#,
+        right_layout.lang_bar_y
     );
 
     render_left_column(&mut svg, data, palette);
-    render_right_column(&mut svg, data, palette);
+    render_right_column(&mut svg, data, palette, right_layout);
 
     svg.push_str("</svg>\n");
     svg
@@ -314,38 +461,20 @@ fn render_left_column(svg: &mut String, data: &MetricsData, palette: Palette) {
         );
     }
 
-    // 2-column compact icon stat list (all 9 requested live totals).
-    let joined_label = format_joined_ago(data.joined_at, data.generated_at);
-    let license_label = match &data.preferred_license {
-        Some(lic) => format!("Preferred license: {}", truncate_chars(lic, 14)),
-        None => "Preferred license: None".to_string(),
+    // Dynamic 2-column compact icon stat list with balanced vertical spacing.
+    let (left_stats, right_stats) = build_stat_rows(data);
+    let max_rows = left_stats.len().max(right_stats.len());
+    let (start_y, row_pitch) = match max_rows {
+        0..=3 => (64.0, 24.0),
+        4 => (62.0, 22.0),
+        5 => (60.0, 20.5),
+        _ => (57.0, 19.0),
     };
-    let disk_label = format!("{} disk used", format_disk_usage(data.total_disk_kb));
-    let repos_label = format!("{} Repositories", data.repo_count);
-    let followers_label = format!("{} Followers", data.followers);
-    let contrib_label = format!("{} Contributions (1y)", data.contributions_1y);
-    let stars_label = format!("{} Stars", data.total_stars);
-    let forks_label = format!("{} Forks", data.total_forks);
-    let releases_label = format!("{} Releases", data.total_releases);
 
-    let left_stats = [
-        (ICON_CLOCK, joined_label),
-        (ICON_REPO, repos_label),
-        (ICON_LAW, license_label),
-        (ICON_DATABASE, disk_label),
-        (ICON_PEOPLE, followers_label),
-    ];
-    let right_stats = [
-        (ICON_COMMIT, contrib_label),
-        (ICON_STAR, stars_label),
-        (ICON_FORK, forks_label),
-        (ICON_TAG, releases_label),
-    ];
-
-    for (idx, (icon, label)) in left_stats.iter().enumerate() {
-        let row_y = 62.0 + idx as f64 * 20.5;
-        render_icon(svg, 16.0, row_y - 11.5, 13.5, icon, palette.text_muted);
-        let text_esc = escape_xml(&truncate_chars(label, 31));
+    for (idx, row) in left_stats.iter().enumerate() {
+        let row_y = start_y + idx as f64 * row_pitch;
+        render_icon(svg, 16.0, row_y - 11.5, 13.5, row.icon, palette.text_muted);
+        let text_esc = escape_xml(&truncate_chars(&row.label, 31));
         let _ = writeln!(
             svg,
             r#"    <text x="36" y="{row_y:.1}" class="sans" font-size="12" fill="{}">{text_esc}</text>"#,
@@ -353,10 +482,10 @@ fn render_left_column(svg: &mut String, data: &MetricsData, palette: Palette) {
         );
     }
 
-    for (idx, (icon, label)) in right_stats.iter().enumerate() {
-        let row_y = 62.0 + idx as f64 * 20.5;
-        render_icon(svg, 250.0, row_y - 11.5, 13.5, icon, palette.text_muted);
-        let text_esc = escape_xml(&truncate_chars(label, 27));
+    for (idx, row) in right_stats.iter().enumerate() {
+        let row_y = start_y + idx as f64 * row_pitch;
+        render_icon(svg, 250.0, row_y - 11.5, 13.5, row.icon, palette.text_muted);
+        let text_esc = escape_xml(&truncate_chars(&row.label, 27));
         let _ = writeln!(
             svg,
             r#"    <text x="270" y="{row_y:.1}" class="sans" font-size="12" fill="{}">{text_esc}</text>"#,
@@ -364,11 +493,18 @@ fn render_left_column(svg: &mut String, data: &MetricsData, palette: Palette) {
         );
     }
 
+    let last_stat_y = if max_rows == 0 {
+        start_y
+    } else {
+        start_y + (max_rows - 1) as f64 * row_pitch
+    };
+    let habits_heading_y = (last_stat_y + 34.0).clamp(154.0, 184.0);
+
     // Coding habits and recent activity.
     render_section_heading(
         svg,
         16.0,
-        180.0,
+        habits_heading_y,
         ICON_PULSE,
         "Coding habits and recent activity",
         palette,
@@ -376,28 +512,34 @@ fn render_left_column(svg: &mut String, data: &MetricsData, palette: Palette) {
     let tz_label = format_tz_label(data.tz_offset_hours);
     let _ = writeln!(
         svg,
-        r#"    <text x="448" y="180" text-anchor="end" class="sans" font-size="10.5" fill="{}">{tz_label}</text>"#,
+        r#"    <text x="448" y="{habits_heading_y:.1}" text-anchor="end" class="sans" font-size="10.5" fill="{}">{tz_label}</text>"#,
         palette.text_muted
     );
 
-    render_hourly_chart(svg, &data.hourly_commits, palette);
+    render_hourly_chart(svg, &data.hourly_commits, habits_heading_y + 22.0, palette);
     render_weekday_chart(svg, &data.weekday_commits, palette);
     render_recent_languages(svg, &data.recent_languages, palette);
 
     svg.push_str("  </g>\n");
 }
 
-fn render_hourly_chart(svg: &mut String, hourly: &[u32; 24], palette: Palette) {
+fn render_hourly_chart(
+    svg: &mut String,
+    hourly: &[u32; 24],
+    subtitle_y: f64,
+    palette: Palette,
+) {
     let _ = writeln!(
         svg,
-        r#"    <text x="16" y="203" class="sans" font-size="11.5" fill="{}">Commit activity per time of the day</text>"#,
+        r#"    <text x="16" y="{subtitle_y:.1}" class="sans" font-size="11.5" fill="{}">Commit activity per time of the day</text>"#,
         palette.text_muted
     );
 
     let plot_x = 18.0;
     let plot_w = 428.0;
     let baseline_y = 304.0;
-    let max_bar_h = 74.0;
+    let top_limit_y = subtitle_y + 24.0;
+    let max_bar_h = (baseline_y - top_limit_y).clamp(62.0, 92.0);
     let slot_w = plot_w / 24.0;
     let bar_w = 10.0;
     let max_val = hourly.iter().copied().max().unwrap_or(0);
@@ -555,19 +697,31 @@ fn render_recent_languages(svg: &mut String, languages: &[LanguageShare], palett
     }
 }
 
-fn render_right_column(svg: &mut String, data: &MetricsData, palette: Palette) {
+fn render_right_column(
+    svg: &mut String,
+    data: &MetricsData,
+    palette: Palette,
+    layout: RightColumnLayout,
+) {
     svg.push_str("  <!-- Right Column -->\n");
     svg.push_str("  <g>\n");
 
-    render_isometric_calendar(svg, data, palette);
-    render_most_used_languages(svg, &data.languages, palette);
-    render_active_repositories(svg, &data.active_repos, data.generated_at, palette);
-    render_repository_topics(svg, &data.topics, palette);
+    render_isometric_calendar(svg, data, palette, layout);
+    render_most_used_languages(svg, &data.languages, palette, layout);
+    render_active_repositories(svg, &data.active_repos, data.generated_at, palette, layout);
+    if layout.has_topics {
+        render_repository_topics(svg, &data.topics, palette, layout);
+    }
 
     svg.push_str("  </g>\n");
 }
 
-fn render_isometric_calendar(svg: &mut String, data: &MetricsData, palette: Palette) {
+fn render_isometric_calendar(
+    svg: &mut String,
+    data: &MetricsData,
+    palette: Palette,
+    layout: RightColumnLayout,
+) {
     render_section_heading(
         svg,
         472.0,
@@ -590,10 +744,9 @@ fn render_isometric_calendar(svg: &mut String, data: &MetricsData, palette: Pale
         .max()
         .unwrap_or(0);
 
-    // 26x7 isometric 3D extruded tile grid positioned at x: 472..766, y: 44..180.
     let grid = IsoGrid {
         origin_x: 532.0,
-        origin_y: 60.0,
+        origin_y: layout.iso_origin_y,
         step_x: 8.4,
         step_y: 3.55,
         tw: 7.5,
@@ -608,45 +761,52 @@ fn render_isometric_calendar(svg: &mut String, data: &MetricsData, palette: Pale
     }
     svg.push_str("    </g>\n");
 
-    // Right-hand streak & average summary column (x: 786..904).
     let stats_x = 904.0;
+    let s0 = layout.stats_start_y;
     let _ = writeln!(
         svg,
-        r#"    <text x="{stats_x:.0}" y="60" text-anchor="end" class="sans" font-size="10.5" fill="{}">Current streak</text>"#,
+        r#"    <text x="{stats_x:.0}" y="{s0:.0}" text-anchor="end" class="sans" font-size="10.5" fill="{}">Current streak</text>"#,
         palette.text_muted
     );
     let current_unit = if data.current_streak == 1 { "day" } else { "days" };
     let _ = writeln!(
         svg,
-        r#"    <text x="{stats_x:.0}" y="77" text-anchor="end" class="sans" font-size="14" font-weight="600" fill="{}">{} {current_unit}</text>"#,
-        palette.text_primary, data.current_streak
+        r#"    <text x="{stats_x:.0}" y="{:.0}" text-anchor="end" class="sans" font-size="14" font-weight="600" fill="{}">{} {current_unit}</text>"#,
+        s0 + 17.0,
+        palette.text_primary,
+        data.current_streak
     );
 
     let _ = writeln!(
         svg,
-        r#"    <text x="{stats_x:.0}" y="102" text-anchor="end" class="sans" font-size="10.5" fill="{}">Longest streak</text>"#,
+        r#"    <text x="{stats_x:.0}" y="{:.0}" text-anchor="end" class="sans" font-size="10.5" fill="{}">Longest streak</text>"#,
+        s0 + 42.0,
         palette.text_muted
     );
     let longest_unit = if data.longest_streak == 1 { "day" } else { "days" };
     let _ = writeln!(
         svg,
-        r#"    <text x="{stats_x:.0}" y="119" text-anchor="end" class="sans" font-size="14" font-weight="600" fill="{}">{} {longest_unit}</text>"#,
-        palette.text_primary, data.longest_streak
+        r#"    <text x="{stats_x:.0}" y="{:.0}" text-anchor="end" class="sans" font-size="14" font-weight="600" fill="{}">{} {longest_unit}</text>"#,
+        s0 + 59.0,
+        palette.text_primary,
+        data.longest_streak
     );
 
     let _ = writeln!(
         svg,
-        r#"    <text x="{stats_x:.0}" y="144" text-anchor="end" class="sans" font-size="10.5" fill="{}">Daily average</text>"#,
+        r#"    <text x="{stats_x:.0}" y="{:.0}" text-anchor="end" class="sans" font-size="10.5" fill="{}">Daily average</text>"#,
+        s0 + 84.0,
         palette.text_muted
     );
     let _ = writeln!(
         svg,
-        r#"    <text x="{stats_x:.0}" y="161" text-anchor="end" class="sans" font-size="14" font-weight="600" fill="{}">{:.1} / day</text>"#,
-        palette.text_primary, data.avg_commits_per_day
+        r#"    <text x="{stats_x:.0}" y="{:.0}" text-anchor="end" class="sans" font-size="14" font-weight="600" fill="{}">{:.1} / day</text>"#,
+        s0 + 101.0,
+        palette.text_primary,
+        data.avg_commits_per_day
     );
 
-    // Compact 5-level intensity key flush-aligned to x=904 beneath the stats.
-    let key_y = 174.0;
+    let key_y = layout.key_y;
     let _ = writeln!(
         svg,
         r#"    <text x="815" y="{:.1}" text-anchor="end" class="sans" font-size="9.5" fill="{}">Less</text>"#,
@@ -682,7 +842,6 @@ fn render_iso_prism(
     let tw = grid.tw;
     let th = grid.th;
 
-    // Top diamond face shifted upward by extrusion height h.
     let top_pts = format!(
         "{:.1},{:.1} {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}",
         cx,
@@ -694,7 +853,6 @@ fn render_iso_prism(
         cx - tw,
         cy - h,
     );
-    // Left extruded wall (mid-tone shading).
     let left_pts = format!(
         "{:.1},{:.1} {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}",
         cx - tw,
@@ -706,7 +864,6 @@ fn render_iso_prism(
         cx - tw,
         cy,
     );
-    // Right extruded wall (deepest shading).
     let right_pts = format!(
         "{:.1},{:.1} {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}",
         cx + tw,
@@ -750,18 +907,23 @@ fn estimate_sans_width(text: &str, font_size: f64) -> f64 {
     base * scale
 }
 
-fn render_most_used_languages(svg: &mut String, languages: &[LanguageShare], palette: Palette) {
+fn render_most_used_languages(
+    svg: &mut String,
+    languages: &[LanguageShare],
+    palette: Palette,
+    layout: RightColumnLayout,
+) {
     render_section_heading(
         svg,
         472.0,
-        207.0,
+        layout.lang_heading_y,
         ICON_CODE,
         "Most used languages",
         palette,
     );
 
     let bar_x: f64 = 472.0;
-    let bar_y: f64 = 218.0;
+    let bar_y: f64 = layout.lang_bar_y;
     let bar_w: f64 = 432.0;
     let bar_h: f64 = 8.0;
 
@@ -774,14 +936,14 @@ fn render_most_used_languages(svg: &mut String, languages: &[LanguageShare], pal
     if languages.is_empty() {
         let _ = writeln!(
             svg,
-            r#"    <text x="472" y="246" class="sans" font-size="11.5" fill="{}">No public non-fork language data available</text>"#,
-            palette.text_muted
+            r#"    <text x="472" y="{:.1}" class="sans" font-size="11.5" fill="{}">No language data available</text>"#,
+            layout.lang_legend_ys[0], palette.text_muted
         );
         return;
     }
 
-    let total_bytes: u64 = languages.iter().map(|l| l.bytes).sum();
-    if total_bytes > 0 {
+    let total_weight: f64 = languages.iter().map(|l| l.weight).sum();
+    if total_weight > 0.0 {
         svg.push_str(r#"    <g clip-path="url(#lang-bar-clip)">"#);
         svg.push('\n');
         let mut cursor_x = bar_x;
@@ -790,7 +952,7 @@ fn render_most_used_languages(svg: &mut String, languages: &[LanguageShare], pal
             let seg_w = if idx + 1 == languages.len() {
                 (bar_x + bar_w - cursor_x).max(0.0)
             } else {
-                ((lang.bytes as f64 / total_bytes as f64) * bar_w).max(2.0)
+                ((lang.weight / total_weight) * bar_w).max(2.0)
             };
             let _ = writeln!(
                 svg,
@@ -801,11 +963,10 @@ fn render_most_used_languages(svg: &mut String, languages: &[LanguageShare], pal
         svg.push_str("    </g>\n");
     }
 
-    // 2-row dot legend flowing cleanly inside x: 472..904.
     let mut row = 0usize;
     let mut cursor_x = 472.0;
     let max_x = 904.0;
-    let row_ys = [246.0, 265.0];
+    let row_ys = layout.lang_legend_ys;
 
     for lang in languages {
         let name = truncate_chars(&lang.name, 13);
@@ -847,11 +1008,12 @@ fn render_active_repositories(
     repos: &[ActiveRepo],
     now: DateTime<Utc>,
     palette: Palette,
+    layout: RightColumnLayout,
 ) {
     render_section_heading(
         svg,
         472.0,
-        301.0,
+        layout.repos_heading_y,
         ICON_REPO,
         "Most active repositories",
         palette,
@@ -860,14 +1022,14 @@ fn render_active_repositories(
     if repos.is_empty() {
         let _ = writeln!(
             svg,
-            r#"    <text x="472" y="326" class="sans" font-size="11.5" fill="{}">No public repositories found</text>"#,
-            palette.text_muted
+            r#"    <text x="472" y="{:.1}" class="sans" font-size="11.5" fill="{}">No public repositories found</text>"#,
+            layout.repos_first_y, palette.text_muted
         );
         return;
     }
 
     for (idx, repo) in repos.iter().take(4).enumerate() {
-        let row_y = 326.0 + idx as f64 * 26.0;
+        let row_y = layout.repos_first_y + idx as f64 * layout.repos_pitch;
         render_icon(svg, 472.0, row_y - 11.0, 13.0, ICON_REPO, palette.text_muted);
 
         let name_esc = escape_xml(&truncate_chars(&repo.name, 22));
@@ -896,7 +1058,6 @@ fn render_active_repositories(
             );
         }
 
-        // Star icon + star count aligned right around x=834.
         render_icon(svg, 796.0, row_y - 10.5, 12.0, ICON_STAR, palette.text_muted);
         let _ = writeln!(
             svg,
@@ -913,29 +1074,25 @@ fn render_active_repositories(
     }
 }
 
-fn render_repository_topics(svg: &mut String, topics: &[String], palette: Palette) {
+fn render_repository_topics(
+    svg: &mut String,
+    topics: &[String],
+    palette: Palette,
+    layout: RightColumnLayout,
+) {
     render_section_heading(
         svg,
         472.0,
-        444.0,
+        layout.topics_heading_y,
         ICON_TAG,
         "Repository topics",
         palette,
     );
 
-    if topics.is_empty() {
-        let _ = writeln!(
-            svg,
-            r#"    <text x="472" y="467" class="sans" font-size="11.5" fill="{}">No repository topics set</text>"#,
-            palette.text_muted
-        );
-        return;
-    }
-
     let mut row = 0usize;
     let mut cursor_x = 472.0;
     let max_x = 904.0;
-    let row_ys = [466.0, 484.0];
+    let row_ys = layout.topics_row_ys;
 
     for topic in topics {
         let clean = truncate_chars(topic, 18);
@@ -992,6 +1149,71 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_stat_rows_omit_zero_values_and_balance_columns() {
+        let mut data = mock_metrics("jpmasangkay", 8);
+        data.followers = 0;
+        data.total_stars = 0;
+        data.total_forks = 0;
+        data.total_releases = 0;
+        data.preferred_license = None;
+
+        let (left, right) = build_stat_rows(&data);
+        assert_eq!(left.len(), 3);
+        assert_eq!(right.len(), 3);
+
+        let all_labels: Vec<&str> = left
+            .iter()
+            .chain(right.iter())
+            .map(|r| r.label.as_str())
+            .collect();
+        assert!(all_labels.iter().any(|l| l.starts_with("Joined GitHub")));
+        assert!(all_labels.iter().any(|l| l.contains("Repositories")));
+        assert!(all_labels.iter().any(|l| l.contains("Contributions (1y)")));
+        assert!(all_labels.iter().any(|l| l.contains("Commits (30d)")));
+        assert!(all_labels.iter().any(|l| l.contains("Active repos (90d)")));
+        assert!(all_labels.iter().any(|l| l.contains("disk used")));
+
+        for forbidden in ["Follower", "Star", "Fork", "Release", "Preferred license"] {
+            assert!(
+                !all_labels.iter().any(|l| l.contains(forbidden)),
+                "unexpected zero/empty stat row containing '{forbidden}'"
+            );
+        }
+
+        // Enable two optional metrics -> 8 rows split evenly 4/4.
+        data.total_stars = 5;
+        data.preferred_license = Some("MIT".to_string());
+        let (left2, right2) = build_stat_rows(&data);
+        assert_eq!(left2.len(), 4);
+        assert_eq!(right2.len(), 4);
+        let combined: Vec<&str> = left2
+            .iter()
+            .chain(right2.iter())
+            .map(|r| r.label.as_str())
+            .collect();
+        assert!(combined.contains(&"5 Stars"));
+        assert!(combined.contains(&"Preferred license: MIT"));
+        assert!(!combined.iter().any(|l| l.contains("Fork") || l.contains("Release") || l.contains("Follower")));
+    }
+
+    #[test]
+    fn empty_topics_omits_section_cleanly() {
+        let mut data = mock_metrics("jpmasangkay", 8);
+        data.topics.clear();
+
+        let svg = render_metrics_svg(&data, Theme::Dark);
+        assert!(!svg.contains("Repository topics"));
+        assert!(!svg.contains("No repository topics set"));
+        // ClipPath y must match tightened language bar y (236).
+        assert!(svg.contains(r#"<rect x="472" y="236" width="432" height="8" rx="4"/>"#));
+
+        data.topics = vec!["rust".to_string()];
+        let svg_with_topics = render_metrics_svg(&data, Theme::Dark);
+        assert!(svg_with_topics.contains("Repository topics"));
+        assert!(svg_with_topics.contains(">rust<"));
+    }
+
+    #[test]
     fn isometric_tile_math_handles_zero_and_peak_days() {
         let grid = IsoGrid {
             origin_x: 500.0,
@@ -1014,12 +1236,10 @@ mod tests {
 
     #[test]
     fn timezone_bucketing_applies_utc_offset() {
-        // 2026-06-15 16:30 UTC (Monday) -> 2026-06-16 00:30 UTC+8 (Tuesday, hour 00)
         let ts = Utc.with_ymd_and_hms(2026, 6, 15, 16, 30, 0).unwrap();
         let (hours, days) = bucket_commit_timestamps(&[ts], 8);
         assert_eq!(hours[0], 1);
         assert_eq!(hours[16], 0);
-        // Sun=0, Mon=1, Tue=2
         assert_eq!(days[2], 1);
     }
 
@@ -1038,7 +1258,6 @@ mod tests {
             .collect();
         let refs: Vec<&ContributionDay> = days.iter().collect();
 
-        // Today is index 6 (count 0), yesterday index 5 & 4 are active => current streak 2, longest 3.
         let today = base + Duration::days(6);
         let (current, longest) = compute_streaks(&refs, today);
         assert_eq!(current, 2);
@@ -1051,8 +1270,6 @@ mod tests {
         for theme in [Theme::Dark, Theme::Light] {
             let rendered = render_metrics_svg(&data, theme);
             assert!(rendered.contains(r#"viewBox="0 0 920 500""#));
-            // Must remain transparent and borderless (no full-canvas background rect or box borders).
-            assert!(!rendered.contains(r#"width="920" height="500""#) || rendered.contains(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 500" width="920" height="500""#));
             assert!(!rendered.contains("scanlines"));
             assert!(!rendered.contains("OPEN TO"));
             assert!(!rendered.contains("<script"));
