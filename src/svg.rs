@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
 use crate::github::{ActiveRepo, ContributionDay, LanguageShare, MetricsData};
 
@@ -164,24 +164,11 @@ pub fn format_joined_ago(joined_at: DateTime<Utc>, now: DateTime<Utc>) -> String
     }
 }
 
-pub fn format_relative_age(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let delta: Duration = now.signed_duration_since(ts);
-    let secs = delta.num_seconds().max(0);
-
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3_600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3_600)
-    } else if secs < 14 * 86_400 {
-        format!("{}d ago", secs / 86_400)
-    } else if secs < 60 * 86_400 {
-        format!("{}w ago", secs / (7 * 86_400))
-    } else if secs < 365 * 86_400 {
-        format!("{}mo ago", secs / (30 * 86_400))
+pub fn format_repo_activity_label(repo: &ActiveRepo) -> String {
+    if repo.recent_commits_90d > 0 {
+        pluralize(repo.recent_commits_90d, "commit", "commits")
     } else {
-        format!("{}y ago", secs / (365 * 86_400))
+        repo.pushed_at.format("%b %-d").to_string()
     }
 }
 
@@ -708,7 +695,7 @@ fn render_right_column(
 
     render_isometric_calendar(svg, data, palette, layout);
     render_most_used_languages(svg, &data.languages, palette, layout);
-    render_active_repositories(svg, &data.active_repos, data.generated_at, palette, layout);
+    render_active_repositories(svg, &data.active_repos, palette, layout);
     if layout.has_topics {
         render_repository_topics(svg, &data.topics, palette, layout);
     }
@@ -1006,7 +993,6 @@ fn render_most_used_languages(
 fn render_active_repositories(
     svg: &mut String,
     repos: &[ActiveRepo],
-    now: DateTime<Utc>,
     palette: Palette,
     layout: RightColumnLayout,
 ) {
@@ -1030,7 +1016,7 @@ fn render_active_repositories(
 
     let visible: Vec<&ActiveRepo> = repos.iter().take(4).collect();
     let any_stars = visible.iter().any(|r| r.stars > 0);
-    let (name_limit, lang_dot_x) = if any_stars { (22, 696.0) } else { (27, 740.0) };
+    let (name_limit, lang_dot_x) = if any_stars { (21, 676.0) } else { (25, 720.0) };
 
     for (idx, repo) in visible.iter().enumerate() {
         let row_y = layout.repos_first_y + idx as f64 * layout.repos_pitch;
@@ -1064,18 +1050,18 @@ fn render_active_repositories(
         }
 
         if repo.stars > 0 {
-            render_icon(svg, 796.0, row_y - 10.5, 12.0, ICON_STAR, palette.text_muted);
+            render_icon(svg, 772.0, row_y - 10.5, 12.0, ICON_STAR, palette.text_muted);
             let _ = writeln!(
                 svg,
-                r#"    <text x="812" y="{row_y:.1}" class="sans" font-size="11" fill="{}">{}</text>"#,
+                r#"    <text x="788" y="{row_y:.1}" class="sans" font-size="11" fill="{}">{}</text>"#,
                 palette.text_muted, repo.stars
             );
         }
 
-        let age = escape_xml(&format_relative_age(repo.pushed_at, now));
+        let activity = escape_xml(&format_repo_activity_label(repo));
         let _ = writeln!(
             svg,
-            r#"    <text x="904" y="{row_y:.1}" text-anchor="end" class="sans" font-size="11" fill="{}">{age}</text>"#,
+            r#"    <text x="904" y="{row_y:.1}" text-anchor="end" class="sans" font-size="11" fill="{}">{activity}</text>"#,
             palette.text_muted
         );
     }
@@ -1129,7 +1115,7 @@ fn render_repository_topics(
 mod tests {
     use super::*;
     use crate::github::{bucket_commit_timestamps, compute_streaks, mock_metrics};
-    use chrono::{NaiveDate, TimeZone};
+    use chrono::{Duration, NaiveDate, TimeZone};
 
     #[test]
     fn xml_escaping_escapes_reserved_chars_and_control_bytes() {
@@ -1212,16 +1198,18 @@ mod tests {
         }
 
         let svg_zero = render_metrics_svg(&data, Theme::Dark);
-        // Top summary still shows total stars, but no active-repo row star marker at x=796/812.
+        // Top summary still shows total stars, but no active-repo row star marker at x=772/788.
         assert!(svg_zero.contains("2 Stars"));
-        assert!(!svg_zero.contains(r#"translate(796.0,"#));
-        assert!(!svg_zero.contains(r#"<text x="812""#));
+        assert!(!svg_zero.contains(r#"translate(772.0,"#));
+        assert!(!svg_zero.contains(r#"<text x="788""#));
+        assert!(svg_zero.contains(">46 commits</text>"));
+        assert!(!svg_zero.contains("h ago</text>"));
 
         // Give one repo stars > 0 -> only that row gets a star marker.
         data.active_repos[1].stars = 7;
         let svg_mixed = render_metrics_svg(&data, Theme::Dark);
-        assert_eq!(svg_mixed.matches(r#"translate(796.0,"#).count(), 1);
-        assert_eq!(svg_mixed.matches(r#"<text x="812""#).count(), 1);
+        assert_eq!(svg_mixed.matches(r#"translate(772.0,"#).count(), 1);
+        assert_eq!(svg_mixed.matches(r#"<text x="788""#).count(), 1);
         assert!(svg_mixed.contains(r#">7</text>"#));
     }
 

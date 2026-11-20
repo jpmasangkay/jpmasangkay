@@ -44,7 +44,7 @@ query UserOverview($login: String!, $from: DateTime!, $to: DateTime!) {
 "#;
 
 const REPOSITORIES_QUERY: &str = r#"
-query OwnedRepositories($login: String!, $cursor: String, $authorId: ID!) {
+query OwnedRepositories($login: String!, $cursor: String, $authorId: ID!, $since90d: GitTimestamp!) {
   user(login: $login) {
     repositories(
       first: 50
@@ -95,6 +95,9 @@ query OwnedRepositories($login: String!, $cursor: String, $authorId: ID!) {
         defaultBranchRef {
           target {
             ... on Commit {
+              recentHistory: history(first: 1, since: $since90d, author: { id: $authorId }) {
+                totalCount
+              }
               history(first: 20, author: { id: $authorId }) {
                 nodes {
                   oid
@@ -131,6 +134,7 @@ pub struct ActiveRepo {
     pub primary_language: Option<String>,
     pub primary_language_color: Option<String>,
     pub stars: u32,
+    pub recent_commits_90d: u32,
     pub pushed_at: DateTime<Utc>,
 }
 
@@ -153,7 +157,11 @@ pub struct RepoSummary {
     pub name: String,
     pub is_private: bool,
     pub stars: u32,
+    pub recent_commits_90d: u32,
     pub pushed_at: Option<DateTime<Utc>>,
+    /// Explicitly tracked only to guarantee non-code metadata updates never affect ranking.
+    #[allow(dead_code)]
+    pub updated_at: Option<DateTime<Utc>>,
     pub primary_language: Option<String>,
     pub primary_language_color: Option<String>,
     pub languages: Vec<RepoLanguageSample>,
@@ -337,7 +345,9 @@ struct BranchRef {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CommitTarget {
+    recent_history: Option<CountNode>,
     history: Option<CommitHistory>,
 }
 
@@ -446,6 +456,9 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
         .rev()
         .collect();
 
+    let recent_cutoff = now - ChronoDuration::days(RECENT_ACTIVITY_DAYS);
+    let since_90d = recent_cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
     // Cursor-paginate through EVERY non-fork repository owned by the user.
     let mut repos: Vec<RepoNode> = Vec::new();
     let mut cursor: Option<String> = None;
@@ -458,6 +471,7 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
                 "login": &user.login,
                 "cursor": cursor,
                 "authorId": &user.id,
+                "since90d": &since_90d,
             }),
         )?;
 
@@ -487,8 +501,6 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
     let mut seen_oids: HashSet<String> = HashSet::new();
     let mut authored_timestamps: Vec<DateTime<Utc>> = Vec::new();
 
-    let recent_cutoff = now - ChronoDuration::days(RECENT_ACTIVITY_DAYS);
-
     for repo in &repos {
         total_stars = total_stars.saturating_add(repo.stargazer_count);
         total_forks = total_forks.saturating_add(repo.fork_count);
@@ -511,7 +523,15 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
-        let is_recent_repo = pushed_at.is_some_and(|ts| ts >= recent_cutoff);
+
+        let recent_commits_90d = repo
+            .default_branch_ref
+            .as_ref()
+            .and_then(|b| b.target.as_ref())
+            .and_then(|t| t.recent_history.as_ref())
+            .map(|h| h.total_count)
+            .unwrap_or(0);
+        let is_recent_repo = recent_commits_90d > 0;
 
         if is_recent_repo && !repo.name.eq_ignore_ascii_case(&user.login) {
             active_repos_90d = active_repos_90d.saturating_add(1);
@@ -554,7 +574,9 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
             name: repo.name.clone(),
             is_private: repo.is_private,
             stars: repo.stargazer_count,
+            recent_commits_90d,
             pushed_at,
+            updated_at: None,
             primary_language: repo.primary_language.as_ref().map(|l| l.name.clone()),
             primary_language_color: repo
                 .primary_language
@@ -707,7 +729,9 @@ pub fn aggregate_normalized_languages(
     result
 }
 
-/// Strictly filters active repositories to public non-profile repositories.
+/// Strictly filters active repositories to public non-profile repositories and ranks
+/// them by authored commit count in the last 90 days (breaking ties with `pushedAt`).
+/// Non-code metadata timestamps (`updatedAt`) are intentionally ignored.
 pub fn filter_public_active_repos(
     repos: &[RepoSummary],
     profile_login: &str,
@@ -723,14 +747,16 @@ pub fn filter_public_active_repos(
                 primary_language: repo.primary_language.clone(),
                 primary_language_color: repo.primary_language_color.clone(),
                 stars: repo.stars,
+                recent_commits_90d: repo.recent_commits_90d,
                 pushed_at,
             })
         })
         .collect();
 
     active.sort_by(|a, b| {
-        b.pushed_at
-            .cmp(&a.pushed_at)
+        b.recent_commits_90d
+            .cmp(&a.recent_commits_90d)
+            .then_with(|| b.pushed_at.cmp(&a.pushed_at))
             .then_with(|| b.stars.cmp(&a.stars))
             .then_with(|| a.name.cmp(&b.name))
     });
@@ -1102,6 +1128,7 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
             primary_language: Some("Rust".to_string()),
             primary_language_color: Some("#dea584".to_string()),
             stars: 18,
+            recent_commits_90d: 46,
             pushed_at: now - ChronoDuration::hours(3),
         },
         ActiveRepo {
@@ -1109,6 +1136,7 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
             primary_language: Some("Rust".to_string()),
             primary_language_color: Some("#dea584".to_string()),
             stars: 12,
+            recent_commits_90d: 29,
             pushed_at: now - ChronoDuration::days(2),
         },
         ActiveRepo {
@@ -1116,6 +1144,7 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
             primary_language: Some("Rust".to_string()),
             primary_language_color: Some("#dea584".to_string()),
             stars: 9,
+            recent_commits_90d: 18,
             pushed_at: now - ChronoDuration::days(5),
         },
         ActiveRepo {
@@ -1123,6 +1152,7 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
             primary_language: Some("TypeScript".to_string()),
             primary_language_color: Some("#3178c6".to_string()),
             stars: 7,
+            recent_commits_90d: 11,
             pushed_at: now - ChronoDuration::days(11),
         },
     ];
@@ -1284,7 +1314,9 @@ mod tests {
                 name: "secret-client-app".to_string(),
                 is_private: true,
                 stars: 99,
+                recent_commits_90d: 80,
                 pushed_at: Some(t1),
+                updated_at: Some(t1),
                 primary_language: Some("C#".to_string()),
                 primary_language_color: Some("#178600".to_string()),
                 languages: vec![RepoLanguageSample {
@@ -1298,7 +1330,9 @@ mod tests {
                 name: "jpmasangkay".to_string(),
                 is_private: false,
                 stars: 1,
+                recent_commits_90d: 60,
                 pushed_at: Some(t1),
+                updated_at: Some(t1),
                 primary_language: Some("Rust".to_string()),
                 primary_language_color: Some("#dea584".to_string()),
                 languages: vec![RepoLanguageSample {
@@ -1312,7 +1346,9 @@ mod tests {
                 name: "rustboy-advance".to_string(),
                 is_private: false,
                 stars: 12,
+                recent_commits_90d: 25,
                 pushed_at: Some(t2),
+                updated_at: Some(t2),
                 primary_language: Some("Rust".to_string()),
                 primary_language_color: Some("#dea584".to_string()),
                 languages: vec![RepoLanguageSample {
@@ -1335,5 +1371,93 @@ mod tests {
         let diag = top_public_repos_by_raw_bytes(&repos, 5);
         assert!(diag.iter().all(|d| d.name != "secret-client-app"));
         assert_eq!(diag[0].name, "rustboy-advance");
+    }
+
+    #[test]
+    fn active_repos_rank_by_authored_commits_ignoring_updated_at_and_profile_repo() {
+        let newest = Utc.with_ymd_and_hms(2026, 11, 20, 12, 0, 0).unwrap();
+        let older_push = Utc.with_ymd_and_hms(2026, 11, 15, 10, 0, 0).unwrap();
+        let even_older = Utc.with_ymd_and_hms(2026, 11, 10, 10, 0, 0).unwrap();
+
+        let repos = vec![
+            // Profile repo with many daily cron commits must always be excluded.
+            RepoSummary {
+                name: "jpmasangkay".to_string(),
+                is_private: false,
+                stars: 0,
+                recent_commits_90d: 90,
+                pushed_at: Some(newest),
+                updated_at: Some(newest),
+                primary_language: Some("Rust".to_string()),
+                primary_language_color: Some("#dea584".to_string()),
+                languages: vec![],
+                topics: vec![],
+            },
+            // Repo with brand-new metadata updatedAt (and even a newer bot push) but 0 authored commits.
+            RepoSummary {
+                name: "metadata-touched-only".to_string(),
+                is_private: false,
+                stars: 50,
+                recent_commits_90d: 0,
+                pushed_at: Some(newest),
+                updated_at: Some(newest),
+                primary_language: Some("TypeScript".to_string()),
+                primary_language_color: Some("#3178c6".to_string()),
+                languages: vec![],
+                topics: vec![],
+            },
+            // Repo with 12 authored commits and older timestamps.
+            RepoSummary {
+                name: "logpulse".to_string(),
+                is_private: false,
+                stars: 0,
+                recent_commits_90d: 12,
+                pushed_at: Some(older_push),
+                updated_at: Some(older_push),
+                primary_language: Some("Rust".to_string()),
+                primary_language_color: Some("#dea584".to_string()),
+                languages: vec![],
+                topics: vec![],
+            },
+            // Repo with 34 authored commits and oldest timestamps -> must rank #1.
+            RepoSummary {
+                name: "rustboy-advance".to_string(),
+                is_private: false,
+                stars: 0,
+                recent_commits_90d: 34,
+                pushed_at: Some(even_older),
+                updated_at: Some(even_older),
+                primary_language: Some("Rust".to_string()),
+                primary_language_color: Some("#dea584".to_string()),
+                languages: vec![],
+                topics: vec![],
+            },
+            // Tie-breaker check: same 12 authored commits as logpulse, newer pushedAt -> ranks above logpulse.
+            RepoSummary {
+                name: "hearthsand".to_string(),
+                is_private: false,
+                stars: 0,
+                recent_commits_90d: 12,
+                pushed_at: Some(newest),
+                updated_at: Some(even_older),
+                primary_language: Some("Rust".to_string()),
+                primary_language_color: Some("#dea584".to_string()),
+                languages: vec![],
+                topics: vec![],
+            },
+        ];
+
+        let ranked = filter_public_active_repos(&repos, "jpmasangkay", 4);
+        let names: Vec<&str> = ranked.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "rustboy-advance",
+                "hearthsand",
+                "logpulse",
+                "metadata-touched-only"
+            ]
+        );
+        assert!(!names.contains(&"jpmasangkay"));
     }
 }
