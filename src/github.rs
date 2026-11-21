@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDate, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -19,7 +21,7 @@ const TOP_TOPICS_LIMIT: usize = 10;
 const TOP_DIAGNOSTIC_REPOS_LIMIT: usize = 5;
 
 const OVERVIEW_QUERY: &str = r#"
-query UserOverview($login: String!, $from: DateTime!, $to: DateTime!) {
+query UserOverview($login: String!, $from: DateTime!, $from30d: DateTime!, $to: DateTime!) {
   user(login: $login) {
     login
     id
@@ -38,6 +40,9 @@ query UserOverview($login: String!, $from: DateTime!, $to: DateTime!) {
           }
         }
       }
+    }
+    recentCommitsCollection: contributionsCollection(from: $from30d, to: $to) {
+      totalCommitContributions
     }
   }
 }
@@ -95,10 +100,8 @@ query OwnedRepositories($login: String!, $cursor: String, $authorId: ID!, $since
         defaultBranchRef {
           target {
             ... on Commit {
-              recentHistory: history(first: 1, since: $since90d, author: { id: $authorId }) {
+              recentHistory: history(first: 100, since: $since90d, author: { id: $authorId }) {
                 totalCount
-              }
-              history(first: 20, author: { id: $authorId }) {
                 nodes {
                   oid
                   committedDate
@@ -222,6 +225,13 @@ struct OverviewUser {
     created_at: String,
     followers: CountNode,
     contributions_collection: ContributionsCollection,
+    recent_commits_collection: RecentCommitsCollection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecentCommitsCollection {
+    total_commit_contributions: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,12 +357,13 @@ struct BranchRef {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CommitTarget {
-    recent_history: Option<CountNode>,
-    history: Option<CommitHistory>,
+    recent_history: Option<CommitHistory>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CommitHistory {
+    total_count: u32,
     nodes: Vec<Option<CommitNode>>,
 }
 
@@ -400,7 +411,10 @@ fn post_graphql<T: for<'de> Deserialize<'de>>(
 
 pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> Result<MetricsData> {
     let now = Utc::now();
-    let from = now - ChronoDuration::days(364);
+    let offset = local_offset(tz_offset_hours);
+    let now_local = now.with_timezone(&offset);
+    let from = now_local - ChronoDuration::days(364);
+    let from_30d = local_window_start(now, tz_offset_hours, RECENT_COMMITS_DAYS);
 
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
@@ -412,8 +426,9 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
         OVERVIEW_QUERY,
         json!({
             "login": username,
-            "from": from.to_rfc3339(),
-            "to": now.to_rfc3339(),
+            "from": from.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+            "from30d": from_30d.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+            "to": now_local.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
         }),
     )?;
 
@@ -427,15 +442,10 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
 
     let all_weeks = parse_calendar_weeks(&user.contributions_collection.contribution_calendar);
     let all_days: Vec<&ContributionDay> = all_weeks.iter().flatten().collect();
-    let today = now.date_naive();
+    let today = local_date(now, tz_offset_hours);
     let (current_streak, longest_streak) = compute_streaks(&all_days, today);
 
-    let cutoff_30d = today - ChronoDuration::days(RECENT_COMMITS_DAYS - 1);
-    let commits_30d: u32 = all_days
-        .iter()
-        .filter(|d| d.date >= cutoff_30d && d.date <= today)
-        .map(|d| d.count)
-        .sum();
+    let commits_30d = user.recent_commits_collection.total_commit_contributions;
 
     let half_year_weeks = take_recent_weeks(&all_weeks, CALENDAR_WEEKS);
     let half_year_days: Vec<&ContributionDay> = half_year_weeks.iter().flatten().collect();
@@ -498,8 +508,7 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
     let mut repo_summaries: Vec<RepoSummary> = Vec::with_capacity(repos.len());
     let mut all_repo_languages: Vec<Vec<RepoLanguageSample>> = Vec::new();
     let mut recent_repo_languages: Vec<Vec<RepoLanguageSample>> = Vec::new();
-    let mut seen_oids: HashSet<String> = HashSet::new();
-    let mut authored_timestamps: Vec<DateTime<Utc>> = Vec::new();
+    let mut authored_commits: Vec<(String, DateTime<Utc>)> = Vec::new();
 
     for repo in &repos {
         total_stars = total_stars.saturating_add(repo.stargazer_count);
@@ -590,23 +599,20 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
             .default_branch_ref
             .as_ref()
             .and_then(|b| b.target.as_ref())
-            .and_then(|t| t.history.as_ref())
+            .and_then(|t| t.recent_history.as_ref())
             .map(|h| &h.nodes)
         {
             for commit in nodes.iter().flatten() {
-                if !seen_oids.insert(commit.oid.clone()) {
-                    continue;
-                }
                 if let Ok(ts) = DateTime::parse_from_rfc3339(&commit.committed_date) {
-                    authored_timestamps.push(ts.with_timezone(&Utc));
+                    authored_commits.push((commit.oid.clone(), ts.with_timezone(&Utc)));
                 }
             }
         }
     }
 
-    // Sort newest commits first, cap at 200 most recent authored commits, and bucket in local TZ.
-    authored_timestamps.sort_by(|a, b| b.cmp(a));
-    authored_timestamps.truncate(MAX_HABIT_COMMITS);
+    // Deduplicate by OID, sort newest commits first, cap at 200 most recent authored commits,
+    // and bucket in local TZ.
+    let authored_timestamps = select_recent_habit_timestamps(&authored_commits, MAX_HABIT_COMMITS);
     let (hourly_commits, weekday_commits) =
         bucket_commit_timestamps(&authored_timestamps, tz_offset_hours);
 
@@ -938,12 +944,55 @@ pub fn compute_streaks(days: &[&ContributionDay], today: NaiveDate) -> (u32, u32
     (current, longest)
 }
 
+pub fn local_offset(tz_offset_hours: i32) -> FixedOffset {
+    FixedOffset::east_opt(tz_offset_hours * 3600)
+        .unwrap_or_else(|| FixedOffset::east_opt(0).expect("UTC offset valid"))
+}
+
+pub fn local_date(ts: DateTime<Utc>, tz_offset_hours: i32) -> NaiveDate {
+    ts.with_timezone(&local_offset(tz_offset_hours)).date_naive()
+}
+
+pub fn local_window_start(
+    now: DateTime<Utc>,
+    tz_offset_hours: i32,
+    days_inclusive: i64,
+) -> DateTime<FixedOffset> {
+    let offset = local_offset(tz_offset_hours);
+    let today = now.with_timezone(&offset).date_naive();
+    let start_date = today - ChronoDuration::days((days_inclusive - 1).max(0));
+    let start_naive = start_date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is always a valid NaiveTime");
+    offset
+        .from_local_datetime(&start_naive)
+        .single()
+        .expect("fixed offset local datetime is always unambiguous")
+}
+
+pub fn select_recent_habit_timestamps(
+    commits: &[(String, DateTime<Utc>)],
+    max_commits: usize,
+) -> Vec<DateTime<Utc>> {
+    let mut seen_oids: HashSet<&str> = HashSet::with_capacity(commits.len());
+    let mut timestamps: Vec<DateTime<Utc>> = Vec::with_capacity(commits.len());
+
+    for (oid, ts) in commits {
+        if seen_oids.insert(oid.as_str()) {
+            timestamps.push(*ts);
+        }
+    }
+
+    timestamps.sort_by(|a, b| b.cmp(a));
+    timestamps.truncate(max_commits);
+    timestamps
+}
+
 pub fn bucket_commit_timestamps(
     timestamps: &[DateTime<Utc>],
     tz_offset_hours: i32,
 ) -> ([u32; 24], [u32; 7]) {
-    let offset = FixedOffset::east_opt(tz_offset_hours * 3600)
-        .unwrap_or_else(|| FixedOffset::east_opt(0).expect("UTC offset valid"));
+    let offset = local_offset(tz_offset_hours);
 
     let mut hourly = [0u32; 24];
     let mut weekday = [0u32; 7];
@@ -966,7 +1015,7 @@ pub fn bucket_commit_timestamps(
 /// Deterministic offline mock dataset for layout inspection (`--mock`).
 pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
     let now = Utc::now();
-    let today = now.date_naive();
+    let today = local_date(now, tz_offset_hours);
 
     // Generate 26 deterministic weeks with organic burst distribution for realistic preview.
     let total_days = CALENDAR_WEEKS * 7;
@@ -1229,7 +1278,6 @@ pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn normalized_language_weighting_prevents_large_repo_skew() {
@@ -1459,5 +1507,91 @@ mod tests {
             ]
         );
         assert!(!names.contains(&"jpmasangkay"));
+    }
+
+    #[test]
+    fn local_date_and_window_start_apply_timezone_offset() {
+        // 2026-11-20 18:30 UTC is already 2026-11-21 02:30 in UTC+8.
+        let utc_ts = Utc.with_ymd_and_hms(2026, 11, 20, 18, 30, 0).unwrap();
+        assert_eq!(
+            local_date(utc_ts, 0),
+            NaiveDate::from_ymd_opt(2026, 11, 20).unwrap()
+        );
+        assert_eq!(
+            local_date(utc_ts, 8),
+            NaiveDate::from_ymd_opt(2026, 11, 21).unwrap()
+        );
+
+        let window_start = local_window_start(utc_ts, 8, RECENT_COMMITS_DAYS);
+        assert_eq!(
+            window_start.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+            "2026-10-23T00:00:00+08:00"
+        );
+    }
+
+    #[test]
+    fn overview_deserializes_dedicated_30d_commit_count_separately_from_calendar() {
+        let payload = json!({
+            "user": {
+                "login": "jpmasangkay",
+                "id": "U_123",
+                "createdAt": "2026-02-13T09:26:53Z",
+                "followers": { "totalCount": 0 },
+                "contributionsCollection": {
+                    "contributionCalendar": {
+                        "totalContributions": 538,
+                        "weeks": [
+                            {
+                                "contributionDays": [
+                                    {
+                                        "date": "2026-11-21",
+                                        "contributionCount": 207,
+                                        "contributionLevel": "FOURTH_QUARTILE"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                },
+                "recentCommitsCollection": {
+                    "totalCommitContributions": 200
+                }
+            }
+        });
+
+        let overview: OverviewData = serde_json::from_value(payload).unwrap();
+        let user = overview.user.unwrap();
+        assert_eq!(
+            user.contributions_collection
+                .contribution_calendar
+                .total_contributions,
+            538
+        );
+        assert_eq!(user.recent_commits_collection.total_commit_contributions, 200);
+    }
+
+    #[test]
+    fn habit_commit_selection_deduplicates_and_retains_large_single_repo_bursts() {
+        let base = Utc.with_ymd_and_hms(2026, 11, 20, 12, 0, 0).unwrap();
+        let mut commits = Vec::new();
+        // 87 recent commits from one very active repo (would previously have been truncated at 20).
+        for i in 0..87 {
+            commits.push((format!("active-{i}"), base - ChronoDuration::hours(i)));
+        }
+        // Duplicate OID should not be double-counted.
+        commits.push(("active-0".to_string(), base));
+        // 150 older commits from other repos.
+        for i in 0..150 {
+            commits.push((
+                format!("older-{i}"),
+                base - ChronoDuration::days(10) - ChronoDuration::hours(i),
+            ));
+        }
+
+        let selected = select_recent_habit_timestamps(&commits, MAX_HABIT_COMMITS);
+        assert_eq!(selected.len(), MAX_HABIT_COMMITS);
+        assert_eq!(selected[0], base);
+        // All 87 commits from the active repo are present at the front.
+        assert_eq!(selected[86], base - ChronoDuration::hours(86));
     }
 }

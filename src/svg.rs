@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 
 use crate::github::{ActiveRepo, ContributionDay, LanguageShare, MetricsData};
 
@@ -164,11 +164,16 @@ pub fn format_joined_ago(joined_at: DateTime<Utc>, now: DateTime<Utc>) -> String
     }
 }
 
-pub fn format_repo_activity_label(repo: &ActiveRepo) -> String {
+pub fn format_repo_activity_label(repo: &ActiveRepo, tz_offset_hours: i32) -> String {
     if repo.recent_commits_90d > 0 {
         pluralize(repo.recent_commits_90d, "commit", "commits")
     } else {
-        repo.pushed_at.format("%b %-d").to_string()
+        let offset = FixedOffset::east_opt(tz_offset_hours * 3600)
+            .unwrap_or_else(|| FixedOffset::east_opt(0).expect("UTC offset valid"));
+        repo.pushed_at
+            .with_timezone(&offset)
+            .format("%b %-d")
+            .to_string()
     }
 }
 
@@ -695,7 +700,13 @@ fn render_right_column(
 
     render_isometric_calendar(svg, data, palette, layout);
     render_most_used_languages(svg, &data.languages, palette, layout);
-    render_active_repositories(svg, &data.active_repos, palette, layout);
+    render_active_repositories(
+        svg,
+        &data.active_repos,
+        data.tz_offset_hours,
+        palette,
+        layout,
+    );
     if layout.has_topics {
         render_repository_topics(svg, &data.topics, palette, layout);
     }
@@ -993,6 +1004,7 @@ fn render_most_used_languages(
 fn render_active_repositories(
     svg: &mut String,
     repos: &[ActiveRepo],
+    tz_offset_hours: i32,
     palette: Palette,
     layout: RightColumnLayout,
 ) {
@@ -1058,7 +1070,7 @@ fn render_active_repositories(
             );
         }
 
-        let activity = escape_xml(&format_repo_activity_label(repo));
+        let activity = escape_xml(&format_repo_activity_label(repo, tz_offset_hours));
         let _ = writeln!(
             svg,
             r#"    <text x="904" y="{row_y:.1}" text-anchor="end" class="sans" font-size="11" fill="{}">{activity}</text>"#,
@@ -1279,6 +1291,33 @@ mod tests {
         let (current, longest) = compute_streaks(&refs, today);
         assert_eq!(current, 2);
         assert_eq!(longest, 3);
+    }
+
+    #[test]
+    fn repo_activity_label_formats_commit_counts_and_local_fallback_date() {
+        let utc_ts = Utc.with_ymd_and_hms(2026, 11, 20, 18, 0, 0).unwrap();
+        let one_commit = ActiveRepo {
+            name: "alpha".to_string(),
+            primary_language: Some("Rust".to_string()),
+            primary_language_color: Some("#dea584".to_string()),
+            stars: 0,
+            recent_commits_90d: 1,
+            pushed_at: utc_ts,
+        };
+        assert_eq!(format_repo_activity_label(&one_commit, 8), "1 commit");
+
+        let many_commits = ActiveRepo {
+            recent_commits_90d: 42,
+            ..one_commit.clone()
+        };
+        assert_eq!(format_repo_activity_label(&many_commits, 8), "42 commits");
+
+        let zero_commits = ActiveRepo {
+            recent_commits_90d: 0,
+            ..one_commit
+        };
+        assert_eq!(format_repo_activity_label(&zero_commits, 0), "Nov 20");
+        assert_eq!(format_repo_activity_label(&zero_commits, 8), "Nov 21");
     }
 
     #[test]
