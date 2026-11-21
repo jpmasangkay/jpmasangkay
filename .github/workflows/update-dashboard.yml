@@ -2,8 +2,8 @@ name: Update Profile Metrics
 
 on:
   schedule:
-    # Run every 3 hours off the top of the hour to reduce GitHub Actions cron queue delay.
-    - cron: "17 */3 * * *"
+    # Run every 5 minutes (the minimum interval supported by GitHub Actions).
+    - cron: "*/5 * * * *"
   workflow_dispatch:
   push:
     branches:
