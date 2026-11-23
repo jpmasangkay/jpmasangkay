@@ -5,6 +5,13 @@ compatibility_date = "2025-05-01"
 [build]
 command = "cargo build --lib --target wasm32-unknown-unknown --no-default-features --features wasm --release && mkdir -p worker/build && cp target/wasm32-unknown-unknown/release/profile_metrics.wasm worker/build/profile_metrics.wasm"
 
+[triggers]
+crons = ["* * * * *"]
+
+[[kv_namespaces]]
+binding = "METRICS_KV"
+id = "0887694033b849b5b7bed4a7f7d6b320"
+
 [vars]
 GITHUB_USERNAME = "jpmasangkay"
 TZ_OFFSET_HOURS = "8"

@@ -23,6 +23,23 @@ function parseIntOr(raw, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function readConfig(env) {
+  return {
+    username: (env.GITHUB_USERNAME || "jpmasangkay").trim(),
+    tzOffsetHours: Math.max(-12, Math.min(14, parseIntOr(env.TZ_OFFSET_HOURS, 8))),
+    ttlSeconds: Math.max(30, parseIntOr(env.CACHE_TTL_SECONDS, 60)),
+  };
+}
+
+function kvKeys(username, tzOffsetHours) {
+  const base = `v1:${username}:${tzOffsetHours}`;
+  return {
+    dark: `${base}:dark`,
+    light: `${base}:light`,
+    hash: `${base}:hash`,
+  };
+}
+
 function resolveTheme(url) {
   const path = url.pathname.replace(/\/+$/, "") || "/";
   if (path === "/metrics-dark.svg" || path === "/dark.svg") {
@@ -93,7 +110,7 @@ function buildSvgResponse(svg, ttlSeconds, cacheStatus, isHead, request) {
     "X-Metrics-Cache": cacheStatus,
   };
 
-  if (request.headers.get("If-None-Match") === etag) {
+  if (request && request.headers.get("If-None-Match") === etag) {
     return new Response(null, { status: 304, headers });
   }
 
@@ -108,7 +125,6 @@ export function createHandler(wasmModule, options = {}) {
     (() => (typeof caches !== "undefined" && caches.default ? caches.default : null));
 
   let wasmExports = null;
-  // Isolate-level cache coalesces simultaneous dark/light fetches and works on *.workers.dev too.
   let memoryCache = null;
   let inFlight = null;
 
@@ -151,7 +167,12 @@ export function createHandler(wasmModule, options = {}) {
     }
   }
 
-  async function refreshSvgs(token, username, tzOffsetHours, ttlSeconds) {
+  async function refreshAndPersist(env, username, tzOffsetHours, ttlSeconds) {
+    const token = env.GITHUB_TOKEN;
+    if (!token) {
+      throw new Error("GITHUB_TOKEN secret is missing");
+    }
+
     const nowMs = nowFn();
 
     const overviewReq = callWasm("wasm_prepare_overview", {
@@ -212,30 +233,47 @@ export function createHandler(wasmModule, options = {}) {
       repo_pages_json: repoPagesJson,
     });
 
+    const combinedHash = `${fnv1aHex(rendered.dark_svg)}:${fnv1aHex(rendered.light_svg)}`;
     const entry = {
       key: `${username}:${tzOffsetHours}`,
       dark: rendered.dark_svg,
       light: rendered.light_svg,
+      hash: combinedHash,
       expiresAt: nowFn() + ttlSeconds * 1000,
     };
     memoryCache = entry;
-    return entry;
+
+    let kvWritten = false;
+    if (env.METRICS_KV) {
+      const keys = kvKeys(username, tzOffsetHours);
+      const prevHash = await env.METRICS_KV.get(keys.hash, { type: "text" });
+      if (prevHash !== combinedHash) {
+        await Promise.all([
+          env.METRICS_KV.put(keys.dark, rendered.dark_svg),
+          env.METRICS_KV.put(keys.light, rendered.light_svg),
+          env.METRICS_KV.put(keys.hash, combinedHash),
+        ]);
+        kvWritten = true;
+      }
+    }
+
+    return { entry, kvWritten };
   }
 
-  async function getFreshEntry(token, username, tzOffsetHours, ttlSeconds) {
+  async function getFreshEntry(env, username, tzOffsetHours, ttlSeconds) {
     const cacheKey = `${username}:${tzOffsetHours}`;
     if (memoryCache && memoryCache.key === cacheKey && nowFn() < memoryCache.expiresAt) {
       return { entry: memoryCache, status: "HIT-MEM" };
     }
 
     if (!inFlight) {
-      inFlight = refreshSvgs(token, username, tzOffsetHours, ttlSeconds).finally(() => {
+      inFlight = refreshAndPersist(env, username, tzOffsetHours, ttlSeconds).finally(() => {
         inFlight = null;
       });
     }
 
     try {
-      const entry = await inFlight;
+      const { entry } = await inFlight;
       return { entry, status: "MISS" };
     } catch (err) {
       if (memoryCache && memoryCache.key === cacheKey) {
@@ -246,17 +284,42 @@ export function createHandler(wasmModule, options = {}) {
   }
 
   return {
+    async scheduled(_event, env, ctx) {
+      if (!env.GITHUB_TOKEN) {
+        console.warn("Skipping scheduled refresh: GITHUB_TOKEN secret is not configured");
+        return;
+      }
+      const { username, tzOffsetHours, ttlSeconds } = readConfig(env);
+      const work = refreshAndPersist(env, username, tzOffsetHours, ttlSeconds)
+        .then(({ entry, kvWritten }) => {
+          console.log(
+            `Scheduled metrics refresh complete for ${username}: hash=${entry.hash} kv_written=${kvWritten}`
+          );
+        })
+        .catch((err) => {
+          console.error(`Scheduled metrics refresh failed: ${err.message || String(err)}`);
+        });
+
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(work);
+      } else {
+        await work;
+      }
+    },
+
     async fetch(request, env, ctx) {
       if (request.method !== "GET" && request.method !== "HEAD") {
         return new Response("Method Not Allowed", { status: 405 });
       }
 
       const url = new URL(request.url);
-      const username = (env.GITHUB_USERNAME || "jpmasangkay").trim();
-      const tzOffsetHours = Math.max(-12, Math.min(14, parseIntOr(env.TZ_OFFSET_HOURS, 8)));
-      const ttlSeconds = Math.max(30, parseIntOr(env.CACHE_TTL_SECONDS, 60));
+      const { username, tzOffsetHours, ttlSeconds } = readConfig(env);
+      const keys = kvKeys(username, tzOffsetHours);
 
       if (url.pathname === "/health") {
+        const kvHash = env.METRICS_KV
+          ? await env.METRICS_KV.get(keys.hash, { type: "text" })
+          : null;
         return new Response(
           JSON.stringify({
             ok: true,
@@ -264,6 +327,9 @@ export function createHandler(wasmModule, options = {}) {
             tz_offset_hours: tzOffsetHours,
             cache_ttl_seconds: ttlSeconds,
             token_configured: Boolean(env.GITHUB_TOKEN),
+            kv_bound: Boolean(env.METRICS_KV),
+            kv_warm: Boolean(kvHash),
+            kv_hash: kvHash,
           }),
           {
             status: 200,
@@ -283,8 +349,7 @@ export function createHandler(wasmModule, options = {}) {
         });
       }
 
-      const token = env.GITHUB_TOKEN;
-      if (!token) {
+      if (!env.GITHUB_TOKEN) {
         return new Response("Server misconfigured: GITHUB_TOKEN secret is missing", {
           status: 500,
           headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
@@ -301,6 +366,7 @@ export function createHandler(wasmModule, options = {}) {
       });
       const targetCacheReq = theme === "dark" ? darkCacheReq : lightCacheReq;
 
+      // 1. Cloudflare per-colo edge cache (fastest, < 5ms).
       if (edgeCache) {
         const edgeHit = await edgeCache.match(targetCacheReq);
         if (edgeHit) {
@@ -316,10 +382,37 @@ export function createHandler(wasmModule, options = {}) {
         }
       }
 
+      // 2. Isolate in-memory cache (< 2ms).
+      const cacheKey = `${username}:${tzOffsetHours}`;
+      if (memoryCache && memoryCache.key === cacheKey && nowFn() < memoryCache.expiresAt) {
+        const svg = theme === "dark" ? memoryCache.dark : memoryCache.light;
+        return buildSvgResponse(svg, ttlSeconds, "HIT-MEM", isHead, request);
+      }
+
+      // 3. Globally replicated Cloudflare KV populated by the 1-minute Cron Trigger (< 25ms).
+      if (env.METRICS_KV) {
+        const kvSvg = await env.METRICS_KV.get(theme === "dark" ? keys.dark : keys.light, {
+          type: "text",
+        });
+        if (kvSvg) {
+          const cacheableResp = buildSvgResponse(kvSvg, ttlSeconds, "HIT-KV", false, null);
+          if (edgeCache) {
+            const putTask = edgeCache.put(targetCacheReq, cacheableResp.clone());
+            if (ctx && typeof ctx.waitUntil === "function") {
+              ctx.waitUntil(putTask);
+            } else {
+              await putTask;
+            }
+          }
+          return buildSvgResponse(kvSvg, ttlSeconds, "HIT-KV", isHead, request);
+        }
+      }
+
+      // 4. Cold-boot fallback only when KV has never been populated yet.
       try {
-        const { entry, status } = await getFreshEntry(token, username, tzOffsetHours, ttlSeconds);
-        const darkResp = buildSvgResponse(entry.dark, ttlSeconds, status, false, new Request(darkCacheReq));
-        const lightResp = buildSvgResponse(entry.light, ttlSeconds, status, false, new Request(lightCacheReq));
+        const { entry, status } = await getFreshEntry(env, username, tzOffsetHours, ttlSeconds);
+        const darkResp = buildSvgResponse(entry.dark, ttlSeconds, status, false, null);
+        const lightResp = buildSvgResponse(entry.light, ttlSeconds, status, false, null);
 
         if (edgeCache && status === "MISS") {
           const putAll = Promise.all([
