@@ -17,7 +17,7 @@ const MAX_HABIT_COMMITS: usize = 200;
 const CALENDAR_WEEKS: usize = 26;
 const RECENT_COMMITS_DAYS: i64 = 30;
 const RECENT_ACTIVITY_DAYS: i64 = 90;
-const TOP_LANGUAGES_LIMIT: usize = 8;
+const TOP_LANGUAGES_LIMIT: usize = 12;
 const RECENT_LANGUAGES_LIMIT: usize = 4;
 const TOP_ACTIVE_REPOS_LIMIT: usize = 4;
 const TOP_TOPICS_LIMIT: usize = 10;
@@ -1236,50 +1236,74 @@ pub fn mock_metrics_at(username: &str, tz_offset_hours: i32, now: DateTime<Utc>)
         LanguageShare {
             name: "Rust".to_string(),
             color: "#dea584".to_string(),
-            weight: 4.21,
-            percent: 42.1,
+            weight: 3.60,
+            percent: 36.0,
         },
         LanguageShare {
             name: "TypeScript".to_string(),
             color: "#3178c6".to_string(),
-            weight: 2.48,
-            percent: 24.8,
+            weight: 2.15,
+            percent: 21.5,
+        },
+        LanguageShare {
+            name: "C#".to_string(),
+            color: "#178600".to_string(),
+            weight: 1.05,
+            percent: 10.5,
         },
         LanguageShare {
             name: "Java".to_string(),
             color: "#b07219".to_string(),
-            weight: 1.12,
-            percent: 11.2,
-        },
-        LanguageShare {
-            name: "Dart".to_string(),
-            color: "#00b4ab".to_string(),
-            weight: 0.68,
-            percent: 6.8,
-        },
-        LanguageShare {
-            name: "Python".to_string(),
-            color: "#3572a5".to_string(),
-            weight: 0.46,
-            percent: 4.6,
-        },
-        LanguageShare {
-            name: "C".to_string(),
-            color: "#555555".to_string(),
-            weight: 0.34,
-            percent: 3.4,
+            weight: 0.72,
+            percent: 7.2,
         },
         LanguageShare {
             name: "HTML".to_string(),
             color: "#e34c26".to_string(),
-            weight: 0.28,
-            percent: 2.8,
+            weight: 0.48,
+            percent: 4.8,
         },
         LanguageShare {
-            name: "Shell".to_string(),
-            color: "#89e051".to_string(),
+            name: "Dart".to_string(),
+            color: "#00b4ab".to_string(),
+            weight: 0.36,
+            percent: 3.6,
+        },
+        LanguageShare {
+            name: "Python".to_string(),
+            color: "#3572a5".to_string(),
+            weight: 0.30,
+            percent: 3.0,
+        },
+        LanguageShare {
+            name: "PHP".to_string(),
+            color: "#4f5d95".to_string(),
+            weight: 0.25,
+            percent: 2.5,
+        },
+        LanguageShare {
+            name: "JavaScript".to_string(),
+            color: "#f1e05a".to_string(),
+            weight: 0.24,
+            percent: 2.4,
+        },
+        LanguageShare {
+            name: "CSS".to_string(),
+            color: "#663399".to_string(),
+            weight: 0.23,
+            percent: 2.3,
+        },
+        LanguageShare {
+            name: "Kotlin".to_string(),
+            color: "#a97bff".to_string(),
             weight: 0.21,
             percent: 2.1,
+        },
+        LanguageShare {
+            name: "GDScript".to_string(),
+            color: "#355570".to_string(),
+            weight: 0.19,
+            percent: 1.9,
         },
         LanguageShare {
             name: "Other".to_string(),
@@ -1495,6 +1519,26 @@ mod tests {
         assert!((shares[1].percent - 40.0).abs() < 1e-6);
         assert_eq!(shares[2].name, "Shell");
         assert!((shares[2].percent - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn top_languages_limit_keeps_top_12_and_aggregates_remainder_into_other() {
+        let repos: Vec<Vec<RepoLanguageSample>> = (0..15)
+            .map(|i| {
+                vec![RepoLanguageSample {
+                    name: format!("Lang{i:02}"),
+                    bytes: (1000 - i * 10) as u64,
+                    color: "#3178c6".to_string(),
+                }]
+            })
+            .collect();
+
+        let shares = aggregate_normalized_languages(&repos, TOP_LANGUAGES_LIMIT, true);
+        assert_eq!(shares.len(), TOP_LANGUAGES_LIMIT + 1);
+        assert_eq!(shares.last().unwrap().name, "Other");
+        let total_pct: f64 = shares.iter().map(|s| s.percent).sum();
+        assert!((total_pct - 100.0).abs() < 1e-6);
+        assert!((shares.last().unwrap().percent - 20.0).abs() < 1e-6);
     }
 
     #[test]

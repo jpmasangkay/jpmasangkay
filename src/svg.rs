@@ -322,7 +322,7 @@ struct RightColumnLayout {
     key_y: f64,
     lang_heading_y: f64,
     lang_bar_y: f64,
-    lang_legend_ys: [f64; 2],
+    lang_legend_ys: [f64; 3],
     repos_heading_y: f64,
     repos_first_y: f64,
     repos_pitch: f64,
@@ -334,15 +334,15 @@ fn right_column_layout(has_topics: bool) -> RightColumnLayout {
     if has_topics {
         RightColumnLayout {
             has_topics: true,
-            iso_origin_y: 60.0,
-            stats_start_y: 60.0,
-            key_y: 174.0,
-            lang_heading_y: 207.0,
-            lang_bar_y: 218.0,
-            lang_legend_ys: [246.0, 265.0],
-            repos_heading_y: 301.0,
-            repos_first_y: 326.0,
-            repos_pitch: 26.0,
+            iso_origin_y: 58.0,
+            stats_start_y: 58.0,
+            key_y: 171.0,
+            lang_heading_y: 202.0,
+            lang_bar_y: 213.0,
+            lang_legend_ys: [238.0, 255.0, 272.0],
+            repos_heading_y: 306.0,
+            repos_first_y: 330.0,
+            repos_pitch: 25.0,
             topics_heading_y: 444.0,
             topics_row_ys: [466.0, 484.0],
         }
@@ -354,10 +354,10 @@ fn right_column_layout(has_topics: bool) -> RightColumnLayout {
             key_y: 182.0,
             lang_heading_y: 224.0,
             lang_bar_y: 236.0,
-            lang_legend_ys: [266.0, 287.0],
-            repos_heading_y: 332.0,
-            repos_first_y: 362.0,
-            repos_pitch: 32.0,
+            lang_legend_ys: [264.0, 283.0, 302.0],
+            repos_heading_y: 342.0,
+            repos_first_y: 372.0,
+            repos_pitch: 31.0,
             topics_heading_y: 0.0,
             topics_row_ys: [0.0, 0.0],
         }
@@ -1240,6 +1240,31 @@ mod tests {
         let svg_with_topics = render_metrics_svg(&data, Theme::Dark);
         assert!(svg_with_topics.contains("Repository topics"));
         assert!(svg_with_topics.contains(">rust<"));
+    }
+
+    #[test]
+    fn language_legend_renders_all_13_entries_across_three_rows() {
+        let mut data = mock_metrics("jpmasangkay", 8);
+        assert_eq!(data.languages.len(), 13);
+
+        for has_topics in [false, true] {
+            if !has_topics {
+                data.topics.clear();
+            } else {
+                data.topics = vec!["rust".to_string()];
+            }
+            let svg = render_metrics_svg(&data, Theme::Light);
+            for lang in &data.languages {
+                assert!(
+                    svg.contains(&format!(">{}</tspan>", escape_xml(&lang.name))),
+                    "missing legend item '{}' (has_topics={has_topics})",
+                    lang.name
+                );
+            }
+            let layout = right_column_layout(has_topics);
+            assert!(svg.contains(&format!(r#"y="{:.1}""#, layout.lang_legend_ys[2])));
+            assert!(layout.lang_legend_ys[2] + 20.0 < layout.repos_heading_y);
+        }
     }
 
     #[test]
