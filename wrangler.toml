@@ -1,0 +1,11 @@
+name = "jpmasangkay-profile-metrics"
+main = "worker/index.js"
+compatibility_date = "2025-05-01"
+
+[build]
+command = "cargo build --lib --target wasm32-unknown-unknown --no-default-features --features wasm --release && mkdir -p worker/build && cp target/wasm32-unknown-unknown/release/profile_metrics.wasm worker/build/profile_metrics.wasm"
+
+[vars]
+GITHUB_USERNAME = "jpmasangkay"
+TZ_OFFSET_HOURS = "8"
+CACHE_TTL_SECONDS = "60"

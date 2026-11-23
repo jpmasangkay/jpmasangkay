@@ -1,4 +1,7 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "cli")]
+use std::thread;
+#[cfg(feature = "cli")]
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -8,8 +11,8 @@ use chrono::{
 use serde::Deserialize;
 use serde_json::json;
 
-const GITHUB_GRAPHQL_ENDPOINT: &str = "https://api.github.com/graphql";
-const USER_AGENT: &str = "jpmasangkay-profile-metrics";
+pub const GITHUB_GRAPHQL_ENDPOINT: &str = "https://api.github.com/graphql";
+pub const USER_AGENT: &str = "jpmasangkay-profile-metrics";
 const MAX_HABIT_COMMITS: usize = 200;
 const CALENDAR_WEEKS: usize = 26;
 const RECENT_COMMITS_DAYS: i64 = 30;
@@ -19,8 +22,10 @@ const RECENT_LANGUAGES_LIMIT: usize = 4;
 const TOP_ACTIVE_REPOS_LIMIT: usize = 4;
 const TOP_TOPICS_LIMIT: usize = 10;
 const TOP_DIAGNOSTIC_REPOS_LIMIT: usize = 5;
+#[cfg(feature = "cli")]
+const GRAPHQL_MAX_ATTEMPTS: usize = 3;
 
-const OVERVIEW_QUERY: &str = r#"
+pub const OVERVIEW_QUERY: &str = r#"
 query UserOverview($login: String!, $from: DateTime!, $from30d: DateTime!, $to: DateTime!) {
   user(login: $login) {
     login
@@ -48,11 +53,11 @@ query UserOverview($login: String!, $from: DateTime!, $from30d: DateTime!, $to: 
 }
 "#;
 
-const REPOSITORIES_QUERY: &str = r#"
+pub const REPOSITORIES_QUERY: &str = r#"
 query OwnedRepositories($login: String!, $cursor: String, $authorId: ID!, $since90d: GitTimestamp!) {
   user(login: $login) {
     repositories(
-      first: 50
+      first: 25
       after: $cursor
       ownerAffiliations: OWNER
       isFork: false
@@ -374,26 +379,25 @@ struct CommitNode {
     committed_date: String,
 }
 
-fn post_graphql<T: for<'de> Deserialize<'de>>(
-    agent: &ureq::Agent,
-    token: &str,
-    query: &str,
-    variables: serde_json::Value,
-) -> Result<T> {
-    let response = agent
-        .post(GITHUB_GRAPHQL_ENDPOINT)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("User-Agent", USER_AGENT)
-        .set("Accept", "application/vnd.github+json")
-        .send_json(json!({
-            "query": query,
-            "variables": variables,
-        }))
-        .context("GitHub GraphQL HTTP request failed")?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverviewIdentity {
+    pub login: String,
+    pub id: String,
+}
 
-    let payload: GraphQlResponse<T> = response
-        .into_json()
-        .context("failed to decode GitHub GraphQL JSON response")?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoPageCursor {
+    pub has_next_page: bool,
+    pub end_cursor: Option<String>,
+}
+
+pub fn is_retryable_http_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+pub fn decode_graphql_payload<T: for<'de> Deserialize<'de>>(raw_json: &str) -> Result<T> {
+    let payload: GraphQlResponse<T> =
+        serde_json::from_str(raw_json).context("failed to decode GitHub GraphQL JSON response")?;
 
     if let Some(errors) = payload.errors {
         let joined = errors
@@ -409,12 +413,153 @@ fn post_graphql<T: for<'de> Deserialize<'de>>(
         .ok_or_else(|| anyhow!("GitHub GraphQL response missing data payload"))
 }
 
-pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> Result<MetricsData> {
-    let now = Utc::now();
+pub fn build_overview_variables(
+    username: &str,
+    now: DateTime<Utc>,
+    tz_offset_hours: i32,
+) -> serde_json::Value {
     let offset = local_offset(tz_offset_hours);
     let now_local = now.with_timezone(&offset);
     let from = now_local - ChronoDuration::days(364);
     let from_30d = local_window_start(now, tz_offset_hours, RECENT_COMMITS_DAYS);
+
+    json!({
+        "login": username,
+        "from": from.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        "from30d": from_30d.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        "to": now_local.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+    })
+}
+
+pub fn build_repositories_variables(
+    login: &str,
+    author_id: &str,
+    cursor: Option<&str>,
+    now: DateTime<Utc>,
+) -> serde_json::Value {
+    let recent_cutoff = now - ChronoDuration::days(RECENT_ACTIVITY_DAYS);
+    let since_90d = recent_cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    json!({
+        "login": login,
+        "cursor": cursor,
+        "authorId": author_id,
+        "since90d": since_90d,
+    })
+}
+
+pub fn extract_overview_identity(
+    raw_overview_json: &str,
+    requested_username: &str,
+) -> Result<OverviewIdentity> {
+    let overview: OverviewData = decode_graphql_payload(raw_overview_json)?;
+    let user = overview
+        .user
+        .ok_or_else(|| anyhow!("GitHub user '{requested_username}' not found"))?;
+    Ok(OverviewIdentity {
+        login: user.login,
+        id: user.id,
+    })
+}
+
+pub fn extract_repo_page_cursor(raw_page_json: &str) -> Result<RepoPageCursor> {
+    let page: ReposData = decode_graphql_payload(raw_page_json)?;
+    let page_info = page
+        .user
+        .ok_or_else(|| anyhow!("GitHub user disappeared during pagination"))?
+        .repositories
+        .page_info;
+    Ok(RepoPageCursor {
+        has_next_page: page_info.has_next_page && page_info.end_cursor.is_some(),
+        end_cursor: page_info.end_cursor,
+    })
+}
+
+pub fn build_metrics_from_graphql_responses(
+    raw_overview_json: &str,
+    raw_repo_pages: &[String],
+    requested_username: &str,
+    now: DateTime<Utc>,
+    tz_offset_hours: i32,
+) -> Result<MetricsData> {
+    let overview: OverviewData = decode_graphql_payload(raw_overview_json)?;
+    let user = overview
+        .user
+        .ok_or_else(|| anyhow!("GitHub user '{requested_username}' not found"))?;
+
+    let mut repos: Vec<RepoNode> = Vec::new();
+    for raw_page in raw_repo_pages {
+        let page: ReposData = decode_graphql_payload(raw_page)?;
+        let connection = page
+            .user
+            .ok_or_else(|| anyhow!("GitHub user '{}' disappeared during pagination", user.login))?
+            .repositories;
+        repos.extend(connection.nodes.into_iter().flatten());
+    }
+
+    compute_metrics(user, repos, now, tz_offset_hours)
+}
+
+#[cfg(feature = "cli")]
+fn post_graphql<T: for<'de> Deserialize<'de>>(
+    agent: &ureq::Agent,
+    token: &str,
+    query: &str,
+    variables: serde_json::Value,
+) -> Result<T> {
+    let body = json!({
+        "query": query,
+        "variables": variables,
+    });
+
+    for attempt in 1..=GRAPHQL_MAX_ATTEMPTS {
+        let outcome = agent
+            .post(GITHUB_GRAPHQL_ENDPOINT)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("User-Agent", USER_AGENT)
+            .set("Accept", "application/vnd.github+json")
+            .send_json(body.clone());
+
+        match outcome {
+            Ok(response) => {
+                let raw = response
+                    .into_string()
+                    .context("failed to read GitHub GraphQL HTTP response body")?;
+                return decode_graphql_payload(&raw);
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                let retryable = is_retryable_http_status(code);
+                if retryable && attempt < GRAPHQL_MAX_ATTEMPTS {
+                    let delay_ms = 400u64 * (1u64 << (attempt - 1));
+                    thread::sleep(Duration::from_millis(delay_ms));
+                    continue;
+                }
+                let detail = response.into_string().unwrap_or_default();
+                if detail.trim().is_empty() {
+                    bail!("GitHub GraphQL HTTP request failed: status code {code}");
+                }
+                bail!(
+                    "GitHub GraphQL HTTP request failed: status code {code}: {}",
+                    detail.trim()
+                );
+            }
+            Err(ureq::Error::Transport(err)) => {
+                if attempt < GRAPHQL_MAX_ATTEMPTS {
+                    let delay_ms = 400u64 * (1u64 << (attempt - 1));
+                    thread::sleep(Duration::from_millis(delay_ms));
+                    continue;
+                }
+                return Err(anyhow!("GitHub GraphQL HTTP transport error: {err}"));
+            }
+        }
+    }
+
+    unreachable!("retry loop always returns or bails on the final attempt")
+}
+
+#[cfg(feature = "cli")]
+pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> Result<MetricsData> {
+    let now = Utc::now();
 
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
@@ -424,18 +569,47 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
         &agent,
         token,
         OVERVIEW_QUERY,
-        json!({
-            "login": username,
-            "from": from.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
-            "from30d": from_30d.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
-            "to": now_local.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
-        }),
+        build_overview_variables(username, now, tz_offset_hours),
     )?;
 
     let user = overview
         .user
         .ok_or_else(|| anyhow!("GitHub user '{username}' not found"))?;
 
+    // Cursor-paginate through EVERY non-fork repository owned by the user.
+    let mut repos: Vec<RepoNode> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page: ReposData = post_graphql(
+            &agent,
+            token,
+            REPOSITORIES_QUERY,
+            build_repositories_variables(&user.login, &user.id, cursor.as_deref(), now),
+        )?;
+
+        let connection = page
+            .user
+            .ok_or_else(|| anyhow!("GitHub user '{}' disappeared during pagination", user.login))?
+            .repositories;
+
+        repos.extend(connection.nodes.into_iter().flatten());
+
+        if connection.page_info.has_next_page && connection.page_info.end_cursor.is_some() {
+            cursor = connection.page_info.end_cursor;
+        } else {
+            break;
+        }
+    }
+
+    compute_metrics(user, repos, now, tz_offset_hours)
+}
+
+fn compute_metrics(
+    user: OverviewUser,
+    repos: Vec<RepoNode>,
+    now: DateTime<Utc>,
+    tz_offset_hours: i32,
+) -> Result<MetricsData> {
     let joined_at = DateTime::parse_from_rfc3339(&user.created_at)
         .context("failed to parse user createdAt timestamp")?
         .with_timezone(&Utc);
@@ -465,39 +639,6 @@ pub fn fetch_live_metrics(token: &str, username: &str, tz_offset_hours: i32) -> 
         .into_iter()
         .rev()
         .collect();
-
-    let recent_cutoff = now - ChronoDuration::days(RECENT_ACTIVITY_DAYS);
-    let since_90d = recent_cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-    // Cursor-paginate through EVERY non-fork repository owned by the user.
-    let mut repos: Vec<RepoNode> = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let page: ReposData = post_graphql(
-            &agent,
-            token,
-            REPOSITORIES_QUERY,
-            json!({
-                "login": &user.login,
-                "cursor": cursor,
-                "authorId": &user.id,
-                "since90d": &since_90d,
-            }),
-        )?;
-
-        let connection = page
-            .user
-            .ok_or_else(|| anyhow!("GitHub user '{}' disappeared during pagination", user.login))?
-            .repositories;
-
-        repos.extend(connection.nodes.into_iter().flatten());
-
-        if connection.page_info.has_next_page && connection.page_info.end_cursor.is_some() {
-            cursor = connection.page_info.end_cursor;
-        } else {
-            break;
-        }
-    }
 
     let mut total_stars = 0u32;
     let mut total_forks = 0u32;
@@ -1013,8 +1154,12 @@ pub fn bucket_commit_timestamps(
 }
 
 /// Deterministic offline mock dataset for layout inspection (`--mock`).
+#[cfg(feature = "cli")]
 pub fn mock_metrics(username: &str, tz_offset_hours: i32) -> MetricsData {
-    let now = Utc::now();
+    mock_metrics_at(username, tz_offset_hours, Utc::now())
+}
+
+pub fn mock_metrics_at(username: &str, tz_offset_hours: i32, now: DateTime<Utc>) -> MetricsData {
     let today = local_date(now, tz_offset_hours);
 
     // Generate 26 deterministic weeks with organic burst distribution for realistic preview.
@@ -1593,5 +1738,126 @@ mod tests {
         assert_eq!(selected[0], base);
         // All 87 commits from the active repo are present at the front.
         assert_eq!(selected[86], base - ChronoDuration::hours(86));
+    }
+
+    #[test]
+    fn retryable_status_identifies_transient_gateway_and_rate_limit_codes() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(is_retryable_http_status(status));
+        }
+        for status in [200, 400, 401, 403, 404, 422] {
+            assert!(!is_retryable_http_status(status));
+        }
+    }
+
+    #[test]
+    fn graphql_response_builder_matches_shared_metrics_pipeline() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 23, 7, 42, 0).unwrap();
+        let overview_json = json!({
+            "data": {
+                "user": {
+                    "login": "jpmasangkay",
+                    "id": "U_ABC",
+                    "createdAt": "2026-02-13T09:26:53Z",
+                    "followers": { "totalCount": 0 },
+                    "contributionsCollection": {
+                        "contributionCalendar": {
+                            "totalContributions": 620,
+                            "weeks": [
+                                {
+                                    "contributionDays": [
+                                        { "date": "2026-11-22", "contributionCount": 4, "contributionLevel": "FIRST_QUARTILE" },
+                                        { "date": "2026-11-23", "contributionCount": 3, "contributionLevel": "FIRST_QUARTILE" }
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                    "recentCommitsCollection": { "totalCommitContributions": 278 }
+                }
+            }
+        })
+        .to_string();
+
+        let page_json = json!({
+            "data": {
+                "user": {
+                    "repositories": {
+                        "pageInfo": { "hasNextPage": false, "endCursor": null },
+                        "nodes": [
+                            {
+                                "name": "secret-work",
+                                "isPrivate": true,
+                                "stargazerCount": 0,
+                                "forkCount": 0,
+                                "diskUsage": 5000,
+                                "pushedAt": "2026-11-23T06:00:00Z",
+                                "isArchived": false,
+                                "licenseInfo": null,
+                                "releases": { "totalCount": 0 },
+                                "primaryLanguage": { "name": "Rust", "color": "#dea584" },
+                                "languages": { "edges": [{ "size": 1000, "node": { "name": "Rust", "color": "#dea584" } }] },
+                                "repositoryTopics": { "nodes": [{ "topic": { "name": "private-only" } }] },
+                                "defaultBranchRef": {
+                                    "target": {
+                                        "recentHistory": {
+                                            "totalCount": 9,
+                                            "nodes": [{ "oid": "p1", "committedDate": "2026-11-23T06:00:00Z" }]
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "name": "rustboy-advance",
+                                "isPrivate": false,
+                                "stargazerCount": 1,
+                                "forkCount": 0,
+                                "diskUsage": 3000,
+                                "pushedAt": "2026-11-23T07:00:00Z",
+                                "isArchived": false,
+                                "licenseInfo": { "spdxId": "MIT", "name": "MIT License" },
+                                "releases": { "totalCount": 0 },
+                                "primaryLanguage": { "name": "Rust", "color": "#dea584" },
+                                "languages": { "edges": [{ "size": 2000, "node": { "name": "Rust", "color": "#dea584" } }] },
+                                "repositoryTopics": { "nodes": [{ "topic": { "name": "emulator" } }] },
+                                "defaultBranchRef": {
+                                    "target": {
+                                        "recentHistory": {
+                                            "totalCount": 133,
+                                            "nodes": [{ "oid": "r1", "committedDate": "2026-11-23T07:00:00Z" }]
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let id = extract_overview_identity(&overview_json, "jpmasangkay").unwrap();
+        assert_eq!(id.login, "jpmasangkay");
+        assert_eq!(id.id, "U_ABC");
+
+        let cursor = extract_repo_page_cursor(&page_json).unwrap();
+        assert!(!cursor.has_next_page);
+
+        let metrics = build_metrics_from_graphql_responses(
+            &overview_json,
+            &[page_json],
+            "jpmasangkay",
+            now,
+            8,
+        )
+        .unwrap();
+        assert_eq!(metrics.repo_count, 2);
+        assert_eq!(metrics.active_repos_90d, 2);
+        assert_eq!(metrics.commits_30d, 278);
+        assert_eq!(metrics.current_streak, 2);
+        assert_eq!(metrics.active_repos.len(), 1);
+        assert_eq!(metrics.active_repos[0].name, "rustboy-advance");
+        assert_eq!(metrics.active_repos[0].recent_commits_90d, 133);
+        assert_eq!(metrics.topics, vec!["emulator"]);
     }
 }

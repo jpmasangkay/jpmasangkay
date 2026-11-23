@@ -1,17 +1,9 @@
 name: Update Profile Metrics
 
+# Static SVG fallback workflow (manual only).
+# Live profile metrics are now served dynamically by the Cloudflare Worker in wrangler.toml.
 on:
-  schedule:
-    # Run every 5 minutes (the minimum interval supported by GitHub Actions).
-    - cron: "*/5 * * * *"
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
 
 permissions:
   contents: write

@@ -4,9 +4,29 @@ version = "0.1.0"
 edition = "2021"
 description = "Generates transparent light and dark GitHub metrics SVGs for jpmasangkay."
 
+[lib]
+name = "profile_metrics"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "profile-metrics"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:ureq", "chrono/clock"]
+wasm = []
+
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", features = ["json"], optional = true }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

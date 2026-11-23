@@ -1,13 +1,11 @@
-mod github;
-mod svg;
-
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::svg::Theme;
+use profile_metrics::svg::Theme;
+use profile_metrics::{github, svg};
 
 const DEFAULT_USERNAME: &str = "jpmasangkay";
 const DEFAULT_TZ_OFFSET: i32 = 8;
